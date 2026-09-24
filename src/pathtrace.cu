@@ -152,7 +152,7 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         int index = x + (y * cam.resolution.x);
         PathSegment& segment = pathSegments[index];
 
-        thrust::default_random_engine rng = makeSeededRandomEngine(iter, x + blockDim.x * y, 0);
+        thrust::default_random_engine rng = makeSeededRandomEngine(iter, x + cam.resolution.x * y, 0);
         thrust::uniform_real_distribution<float> u01(0, 1);
 
 #if DEPTH_OF_FIELD
@@ -160,7 +160,7 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
 		glm::vec3 focalPoint = cam.position + cam.view * focusDistance;
 
         float r = lensRadius * sqrtf(u01(rng));
-        float theta = 2.0f * u01(rng);
+        float theta = TWO_PI * u01(rng);
 
         glm::vec3 aperturePt = cam.position
             + r * cosf(theta) * cam.right
@@ -172,8 +172,8 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         // implement antialiasing by jittering the ray
 
 		segment.ray.direction = glm::normalize((focalPoint
-            - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f + u01(rng))
-            - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f + u01(rng)) - aperturePt)
+            - cam.right * focusDistance * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f + u01(rng))
+            - cam.up * focusDistance * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f + u01(rng)) - aperturePt)
         );
 #else
         segment.ray.origin = cam.position;
@@ -517,8 +517,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // * Finally, add this iteration's results to the image. This has been done
     //   for you.
 
-    float focalLength = 2;
-	float lensRadius = 0.008f;
+    const float focalLength = guiData ? guiData->FocalLength : 2.0f;
+    const float lensRadius = guiData ? guiData->LensRadius : 0.008f;
 
     generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths, focalLength, lensRadius);
     checkCUDAError("generate camera ray");

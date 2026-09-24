@@ -285,6 +285,19 @@ void RenderImGui()
     //ImGui::SameLine();
     //ImGui::Text("counter = %d", counter);
     ImGui::Text("Traced Depth %d", imguiData->TracedDepth);
+    ImGui::Separator();
+    ImGui::Text("Depth of Field");
+
+    bool lensSettingsChanged = false;
+    lensSettingsChanged |= ImGui::SliderFloat(
+        "Focal Length", &imguiData->FocalLength, 0.1f, 20.0f, "%.3f");
+    lensSettingsChanged |= ImGui::SliderFloat(
+        "Lens Radius", &imguiData->LensRadius, 0.0f, 0.1f, "%.4f");
+    if (lensSettingsChanged)
+    {
+        camchanged = true;
+    }
+
     ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
     ImGui::End();
 
