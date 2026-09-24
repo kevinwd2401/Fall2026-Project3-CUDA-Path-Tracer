@@ -54,4 +54,8 @@ __host__ __device__ void scatterRay(
     // TODO: implement this.
     // A basic implementation of pure-diffuse shading will just call the
     // calculateRandomDirectionInHemisphere defined above.
+    normal = glm::normalize(normal);
+    pathSegment.ray.direction = calculateRandomDirectionInHemisphere(normal, rng);
+	pathSegment.ray.origin = intersect + 0.001f * normal;
+
 }
