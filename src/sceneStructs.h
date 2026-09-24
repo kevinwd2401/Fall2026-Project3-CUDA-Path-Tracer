@@ -15,6 +15,17 @@ enum GeomType
     CUBE
 };
 
+enum MaterialType
+{
+    MATERIAL_DIFFUSE = 0,
+    MATERIAL_COOK_TORRANCE,
+    MATERIAL_DIELECTRIC,
+    MATERIAL_MIRROR,
+    MATERIAL_MICROFACETS,
+    MATERIAL_EMISSIVE,
+    MATERIAL_TYPE_COUNT
+};
+
 struct Ray
 {
     glm::vec3 origin;
@@ -36,13 +47,14 @@ struct Geom
 struct Material
 {
     glm::vec3 color;
+    MaterialType type;
     struct
     {
         float exponent;
         glm::vec3 color;
     } specular;
     float hasReflective;
-    float hasRefractive;
+    float hasDielectric;
     float indexOfRefraction;
     float emittance;
 };

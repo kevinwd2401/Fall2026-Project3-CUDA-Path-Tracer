@@ -14,6 +14,38 @@
 using namespace std;
 using json = nlohmann::json;
 
+namespace
+{
+MaterialType parseMaterialType(const std::string& type)
+{
+    if (type == "Cook-Torrance" || type == "CookTorrance" || type == "cook-torrance" ||
+        type == "Plastic" || type == "Metallic")
+    {
+        return MATERIAL_COOK_TORRANCE;
+    }
+    if (type == "Dielectric" || type == "dielectric" ||
+        type == "Refractive" || type == "refractive" ||
+        type == "Glass" || type == "glass")
+    {
+        return MATERIAL_DIELECTRIC;
+    }
+    if (type == "Mirror" || type == "mirror" || type == "Specular")
+    {
+        return MATERIAL_MIRROR;
+    }
+    if (type == "Microfacets" || type == "microfacets" || type == "Microfacet" || type == "microfacet")
+    {
+        return MATERIAL_MICROFACETS;
+    }
+    if (type == "Emissive" || type == "emissive" || type == "Emitting" || type == "emitting")
+    {
+        return MATERIAL_EMISSIVE;
+    }
+
+    return MATERIAL_DIFFUSE;
+}
+}
+
 Scene::Scene(string filename)
 {
     cout << "Reading scene from " << filename << " ..." << endl;
@@ -42,23 +74,15 @@ void Scene::loadFromJSON(const std::string& jsonName)
         const auto& name = item.key();
         const auto& p = item.value();
         Material newMaterial{};
-        // TODO: handle materials loading differently
-        if (p["TYPE"] == "Diffuse")
-        {
-            const auto& col = p["RGB"];
-            newMaterial.color = glm::vec3(col[0], col[1], col[2]);
-        }
-        else if (p["TYPE"] == "Emitting")
-        {
-            const auto& col = p["RGB"];
-            newMaterial.color = glm::vec3(col[0], col[1], col[2]);
-            newMaterial.emittance = p["EMITTANCE"];
-        }
-        else if (p["TYPE"] == "Specular")
-        {
-            const auto& col = p["RGB"];
-            newMaterial.color = glm::vec3(col[0], col[1], col[2]);
-        }
+
+        const std::string type = p.value("TYPE", "Diffuse");
+        newMaterial.type = parseMaterialType(type);
+
+        const auto& col = p["RGB"];
+        newMaterial.color = glm::vec3(col[0], col[1], col[2]);
+        newMaterial.emittance = p.value("EMITTANCE", 0.0f);
+        newMaterial.indexOfRefraction = p.value("IOR", p.value("INDEX_OF_REFRACTION", 1.55f));
+
         MatNameToID[name] = materials.size();
         materials.emplace_back(newMaterial);
     }

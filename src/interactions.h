@@ -24,7 +24,7 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
  *
  * The visual effect you want is to straight-up add the diffuse and specular
  * components. You can do this in a few ways. This logic also applies to
- * combining other types of materias (such as refractive).
+ * combining other types of materials (such as dielectric).
  *
  * - Always take an even (50/50) split between a each effect (a diffuse bounce
  *   and a specular bounce), but divide the resulting color of either branch
@@ -35,8 +35,8 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
  * - Pick the split based on the intensity of each material color, and divide
  *   branch result by that branch's probability (whatever probability you use).
  *
- * This method applies its changes to the Ray parameter `ray` in place.
- * It also modifies the color `color` of the ray in place.
+ * These helpers only update the next ray. BSDF throughput is evaluated by
+ * shadeBSDF so all path radiance updates happen in one place.
  *
  * You may need to change the parameter list for your purposes!
  */
@@ -44,5 +44,23 @@ __host__ __device__ void scatterRay(
     PathSegment& pathSegment,
     glm::vec3 intersect,
     glm::vec3 normal,
-    const Material& m,
+    thrust::default_random_engine& rng);
+
+__device__ void scatterMirror(
+    PathSegment& pathSegment,
+    const glm::vec3& intersect,
+    glm::vec3 normal);
+
+__device__ void scatterRoughSpecular(
+    PathSegment& pathSegment,
+    const glm::vec3& intersect,
+    glm::vec3 normal,
+    float roughness,
+    thrust::default_random_engine& rng);
+
+__device__ void scatterDielectric(
+    PathSegment& pathSegment,
+    const glm::vec3& intersect,
+    glm::vec3 normal,
+    const Material& material,
     thrust::default_random_engine& rng);

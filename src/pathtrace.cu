@@ -7,7 +7,8 @@
 #include <thrust/random.h>
 #include <thrust/remove.h>
 #include <thrust/sort.h>
-#include <thrust/device_ptr.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
 
 #include "sceneStructs.h"
 #include "scene.h"
@@ -18,6 +19,7 @@
 #include "interactions.h"
 
 #define MATERIAL_SORT 0
+#define DEPTH_OF_FIELD 1
 #define ERRORCHECK 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
@@ -83,6 +85,7 @@ static Geom* dev_geoms = NULL;
 static Material* dev_materials = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
+static int* dev_materialSortKeys = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 // ...
 
@@ -112,6 +115,8 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
+    cudaMalloc(&dev_materialSortKeys, pixelcount * sizeof(int));
+
     // TODO: initialize any extra device memeory you need
 
     checkCUDAError("pathtraceInit");
@@ -124,6 +129,7 @@ void pathtraceFree()
     cudaFree(dev_geoms);
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
+    cudaFree(dev_materialSortKeys);
     // TODO: clean up any extra device memory you created
 
     checkCUDAError("pathtraceFree");
@@ -137,7 +143,7 @@ void pathtraceFree()
 * motion blur - jitter rays "in time"
 * lens effect - jitter ray origin positions based on a lens
 */
-__global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, PathSegment* pathSegments)
+__global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, PathSegment* pathSegments, const float focusDistance, const float lensRadius)
 {
     int x = (blockIdx.x * blockDim.x) + threadIdx.x;
     int y = (blockIdx.y * blockDim.y) + threadIdx.y;
@@ -146,17 +152,38 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         int index = x + (y * cam.resolution.x);
         PathSegment& segment = pathSegments[index];
 
-        segment.ray.origin = cam.position;
-        segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
-
-        // implement antialiasing by jittering the ray
         thrust::default_random_engine rng = makeSeededRandomEngine(iter, x + blockDim.x * y, 0);
         thrust::uniform_real_distribution<float> u01(0, 1);
 
-        segment.ray.direction = glm::normalize(cam.view
+#if DEPTH_OF_FIELD
+
+		glm::vec3 focalPoint = cam.position + cam.view * focusDistance;
+
+        float r = lensRadius * sqrtf(u01(rng));
+        float theta = 2.0f * u01(rng);
+
+        glm::vec3 aperturePt = cam.position
+            + r * cosf(theta) * cam.right
+            + r * sinf(theta) * cam.up;
+
+        segment.ray.origin = aperturePt;
+        segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
+
+        // implement antialiasing by jittering the ray
+
+		segment.ray.direction = glm::normalize((focalPoint
             - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f + u01(rng))
-            - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f + u01(rng))
+            - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f + u01(rng)) - aperturePt)
         );
+#else
+        segment.ray.origin = cam.position;
+        segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
+
+        segment.ray.direction = glm::normalize((cam.view
+            - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f + u01(rng))
+            - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f + u01(rng)))
+        );
+#endif
 
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
@@ -232,6 +259,83 @@ __global__ void computeIntersections(
     }
 }
 
+__device__ void bsdfCoordinateSystem(
+    const glm::vec3& normal,
+    glm::vec3& tangent,
+    glm::vec3& bitangent)
+{
+    if (fabsf(normal.x) > fabsf(normal.z))
+    {
+        tangent = glm::normalize(glm::vec3(-normal.y, normal.x, 0.0f));
+    }
+    else
+    {
+        tangent = glm::normalize(glm::vec3(0.0f, -normal.z, normal.y));
+    }
+    bitangent = glm::normalize(glm::cross(normal, tangent));
+}
+
+__device__ glm::vec3 bsdfWorldToLocal(const glm::vec3& normal, const glm::vec3& v)
+{
+    glm::vec3 tangent;
+    glm::vec3 bitangent;
+    bsdfCoordinateSystem(normal, tangent, bitangent);
+    return glm::vec3(glm::dot(v, tangent), glm::dot(v, bitangent), glm::dot(v, normal));
+}
+
+__device__ float bsdfTrowbridgeReitzLambda(const glm::vec3& w, float roughness)
+{
+    if (fabsf(w.z) <= 0.0f)
+    {
+        return 0.0f;
+    }
+
+    float absTanTheta = sqrtf(fmaxf(0.0f, 1.0f - w.z * w.z)) / fabsf(w.z);
+    if (isinf(absTanTheta))
+    {
+        return 0.0f;
+    }
+
+    float alphaTanTheta = roughness * absTanTheta;
+    return 0.5f * (-1.0f + sqrtf(1.0f + alphaTanTheta * alphaTanTheta));
+}
+
+__device__ glm::vec3 roughSpecularThroughput(
+    const glm::vec3& incoming,
+    const glm::vec3& outgoing,
+    glm::vec3 normal,
+    const Material& material,
+    float roughness)
+{
+    normal = glm::normalize(normal);
+    if (glm::dot(incoming, normal) > 0.0f)
+    {
+        normal = -normal;
+    }
+
+    glm::vec3 wo = bsdfWorldToLocal(normal, -incoming);
+    if (glm::length2(outgoing - glm::reflect(incoming, normal)) < 1e-10f)
+    {
+        return material.color;
+    }
+
+    glm::vec3 wi = bsdfWorldToLocal(normal, outgoing);
+    glm::vec3 wh = glm::normalize(wo + wi);
+    float cosThetaO = fabsf(wo.z);
+    float absCosThetaH = fabsf(wh.z);
+    float woDotWh = fabsf(glm::dot(wo, wh));
+
+    if (cosThetaO <= 0.0f || absCosThetaH <= 0.0f || woDotWh <= 0.0f)
+    {
+        return glm::vec3(0.0f);
+    }
+
+    float lambdaO = bsdfTrowbridgeReitzLambda(wo, roughness);
+    float lambdaI = bsdfTrowbridgeReitzLambda(wi, roughness);
+    float G = 1.0f / (1.0f + lambdaO + lambdaI);
+    return material.color * (G * woDotWh / (cosThetaO * absCosThetaH));
+}
+
 __global__ void shadeBSDF(
     int iter,
     int num_paths,
@@ -246,15 +350,56 @@ __global__ void shadeBSDF(
         if (intersection.t > 0.0f)
         {
             Material material = materials[intersection.materialId];
-			PathSegment pathSegment = pathSegments[idx];
-            if (material.emittance > 0.0f) {
+            PathSegment pathSegment = pathSegments[idx];
+            if (material.type == MATERIAL_EMISSIVE || material.emittance > 0.0f) {
                 pathSegment.color *= (material.color * material.emittance);
                 pathSegment.remainingBounces = 0;
             }
             else {
-                thrust::default_random_engine rng = makeSeededRandomEngine(iter, idx, pathSegment.remainingBounces);
-                pathSegment.color *= material.color;
-                scatterRay(pathSegment, pathSegment.ray.origin + intersection.t * pathSegment.ray.direction, intersection.surfaceNormal, material, rng);
+                glm::vec3 incoming = glm::normalize(pathSegment.ray.direction);
+                glm::vec3 geometricNormal = glm::normalize(intersection.surfaceNormal);
+                bool enteringDielectric = glm::dot(incoming, geometricNormal) < 0.0f;
+                glm::vec3 normal = geometricNormal;
+                if (!enteringDielectric)
+                {
+                    normal = -normal;
+                }
+                thrust::default_random_engine rng = makeSeededRandomEngine(
+                    iter,
+                    pathSegment.pixelIndex,
+                    pathSegment.remainingBounces);
+                glm::vec3 intersect = pathSegment.ray.origin + intersection.t * pathSegment.ray.direction;
+                switch (material.type)
+                {
+                case MATERIAL_MIRROR:
+                    pathSegment.color *= material.color;
+                    scatterMirror(pathSegment, intersect, normal);
+                    break;
+                case MATERIAL_DIELECTRIC:
+                    scatterDielectric(pathSegment, intersect, geometricNormal, material, rng);
+                    if (glm::dot(pathSegment.ray.direction, normal) < 0.0f)
+                    {
+                        float eta = material.indexOfRefraction > 0.0f ? material.indexOfRefraction : 1.55f;
+                        float etaRatio = enteringDielectric ? 1.0f / eta : eta;
+                        pathSegment.color *= material.color * (etaRatio * etaRatio);
+                    }
+                    break;
+                case MATERIAL_COOK_TORRANCE:
+                    scatterRoughSpecular(pathSegment, intersect, normal, 0.20f, rng);
+                    pathSegment.color *= roughSpecularThroughput(
+                        incoming, pathSegment.ray.direction, normal, material, 0.20f);
+                    break;
+                case MATERIAL_MICROFACETS:
+                    scatterRoughSpecular(pathSegment, intersect, normal, 0.45f, rng);
+                    pathSegment.color *= roughSpecularThroughput(
+                        incoming, pathSegment.ray.direction, normal, material, 0.45f);
+                    break;
+                case MATERIAL_DIFFUSE:
+                default:
+                    pathSegment.color *= material.color;
+                    scatterRay(pathSegment, intersect, geometricNormal, rng);
+                    break;
+                }
                 --pathSegment.remainingBounces;
             }
             pathSegments[idx] = pathSegment;
@@ -266,7 +411,29 @@ __global__ void shadeBSDF(
     }
 }
 
+__global__ void buildMaterialSortKeys(
+    int num_paths,
+    int material_count,
+    ShadeableIntersection* shadeableIntersections,
+    Material* materials,
+    int* materialSortKeys)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
+    if (idx < num_paths)
+    {
+        ShadeableIntersection intersection = shadeableIntersections[idx];
+        if (intersection.t > 0.0f)
+        {
+            Material material = materials[intersection.materialId];
+            materialSortKeys[idx] = static_cast<int>(material.type) * material_count + intersection.materialId;
+        }
+        else
+        {
+            materialSortKeys[idx] = MATERIAL_TYPE_COUNT * material_count;
+        }
+    }
+}
 
 // Add the current iteration's output to the overall image
 __global__ void finalGather(int nPaths, glm::vec3* image, PathSegment* iterationPaths)
@@ -299,12 +466,6 @@ struct IsTerminated {
     __host__ __device__
         bool operator()(const PathSegment& p) const {
         return p.remainingBounces <= 0;
-    }
-};
-
-struct MaterialIDOrder {
-    __host__ __device__ bool operator()(ShadeableIntersection x, ShadeableIntersection y) const {
-        return x.materialId < y.materialId;
     }
 };
 
@@ -356,7 +517,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // * Finally, add this iteration's results to the image. This has been done
     //   for you.
 
-    generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths);
+    float focalLength = 2;
+	float lensRadius = 0.008f;
+
+    generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths, focalLength, lensRadius);
     checkCUDAError("generate camera ray");
 
     int depth = 0;
@@ -395,15 +559,25 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         // path segments that have been reshuffled to be contiguous in memory.
 
 #if MATERIAL_SORT
-        thrust::sort_by_key(
-            thrust::device_pointer_cast(dev_intersections),
-            thrust::device_pointer_cast(dev_intersections) + num_paths,
-            thrust::device_pointer_cast(dev_paths),
-            MaterialIDOrder{}
+        buildMaterialSortKeys<<<numblocksPathSegmentTracing, blockSize1d>>>(
+            num_paths,
+            hst_scene->materials.size(),
+            dev_intersections,
+            dev_materials,
+            dev_materialSortKeys
         );
+        checkCUDAError("build material sort keys");
+
+        auto sortedValues = thrust::make_zip_iterator(thrust::make_tuple(dev_intersections, dev_paths));
+        thrust::sort_by_key(
+            thrust::device,
+            dev_materialSortKeys,
+            dev_materialSortKeys + num_paths,
+            sortedValues
+        );
+        checkCUDAError("sort paths by material type");
+
 #endif
-
-
         shadeBSDF<<<numblocksPathSegmentTracing, blockSize1d>>>(
             iter,
             num_paths,

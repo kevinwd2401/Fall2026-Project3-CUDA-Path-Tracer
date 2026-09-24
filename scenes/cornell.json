@@ -24,7 +24,7 @@
         },
         "specular_white":
         {
-            "TYPE":"Specular",
+            "TYPE":"Dielectric",
             "RGB":[0.98, 0.98, 0.98],
             "ROUGHNESS":0.0
         }
