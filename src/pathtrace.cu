@@ -19,6 +19,8 @@
 #include "interactions.h"
 
 #define MATERIAL_SORT 0
+#define RUSSIAN_ROULETTE 1
+#define RUSSIAN_ROULETTE_START_DEPTH 3
 #define DEPTH_OF_FIELD 1
 #define ERRORCHECK 1
 
@@ -338,6 +340,7 @@ __device__ glm::vec3 roughSpecularThroughput(
 
 __global__ void shadeBSDF(
     int iter,
+    int depth,
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
@@ -401,6 +404,26 @@ __global__ void shadeBSDF(
                     break;
                 }
                 --pathSegment.remainingBounces;
+
+#if RUSSIAN_ROULETTE
+                if (depth >= RUSSIAN_ROULETTE_START_DEPTH && pathSegment.remainingBounces > 0)
+                {
+                    const float survivalProbability = glm::clamp(
+                        fmaxf(pathSegment.color.x, fmaxf(pathSegment.color.y, pathSegment.color.z)),
+                        0.05f,
+                        0.95f);
+                    thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
+                    if (u01(rng) > survivalProbability)
+                    {
+                        pathSegment.color = glm::vec3(0.0f);
+                        pathSegment.remainingBounces = 0;
+                    }
+                    else
+                    {
+                        pathSegment.color /= survivalProbability;
+                    }
+                }
+#endif
             }
             pathSegments[idx] = pathSegment;
         }
@@ -580,6 +603,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 #endif
         shadeBSDF<<<numblocksPathSegmentTracing, blockSize1d>>>(
             iter,
+            depth,
             num_paths,
             dev_intersections,
             dev_paths,
