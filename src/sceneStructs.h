@@ -12,7 +12,8 @@
 enum GeomType
 {
     SPHERE,
-    CUBE
+    CUBE,
+    TRIANGLE
 };
 
 enum MaterialType
@@ -42,11 +43,19 @@ struct Geom
     glm::mat4 transform;
     glm::mat4 inverseTransform;
     glm::mat4 invTranspose;
+
+    // glTF meshes are flattened into world-space triangles before they are
+    // copied to the device.  Keeping them in Geom lets the existing primitive
+    // upload and nearest-hit loop serve analytic and mesh primitives alike.
+    glm::vec3 triangleVertices[3];
+    glm::vec3 triangleNormals[3];
+    int hasVertexNormals;
 };
 
 struct Material
 {
     glm::vec3 color;
+    glm::vec3 emission;
     MaterialType type;
     struct
     {
@@ -57,6 +66,8 @@ struct Material
     float hasDielectric;
     float indexOfRefraction;
     float emittance;
+    float metallic;
+    float roughness;
 };
 
 struct Camera

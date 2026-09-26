@@ -225,6 +225,7 @@ __global__ void computeIntersections(
         for (int i = 0; i < geoms_size; i++)
         {
             Geom& geom = geoms[i];
+            t = -1.0f;
 
             if (geom.type == CUBE)
             {
@@ -234,7 +235,10 @@ __global__ void computeIntersections(
             {
                 t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
             }
-            // TODO: add more intersection tests here... triangle? metaball? CSG?
+            else if (geom.type == TRIANGLE)
+            {
+                t = triangleIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+            }
 
             // Compute the minimum t from the intersection tests to determine what
             // scene geometry object was hit first.
@@ -316,9 +320,11 @@ __device__ glm::vec3 roughSpecularThroughput(
     }
 
     glm::vec3 wo = bsdfWorldToLocal(normal, -incoming);
+    const float metallic = glm::clamp(material.metallic, 0.0f, 1.0f);
+    const glm::vec3 f0 = glm::mix(glm::vec3(0.04f), material.color, metallic);
     if (glm::length2(outgoing - glm::reflect(incoming, normal)) < 1e-10f)
     {
-        return material.color;
+        return f0;
     }
 
     glm::vec3 wi = bsdfWorldToLocal(normal, outgoing);
@@ -335,7 +341,7 @@ __device__ glm::vec3 roughSpecularThroughput(
     float lambdaO = bsdfTrowbridgeReitzLambda(wo, roughness);
     float lambdaI = bsdfTrowbridgeReitzLambda(wi, roughness);
     float G = 1.0f / (1.0f + lambdaO + lambdaI);
-    return material.color * (G * woDotWh / (cosThetaO * absCosThetaH));
+    return f0 * (G * woDotWh / (cosThetaO * absCosThetaH));
 }
 
 __global__ void shadeBSDF(
@@ -354,8 +360,13 @@ __global__ void shadeBSDF(
         {
             Material material = materials[intersection.materialId];
             PathSegment pathSegment = pathSegments[idx];
-            if (material.type == MATERIAL_EMISSIVE || material.emittance > 0.0f) {
-                pathSegment.color *= (material.color * material.emittance);
+            glm::vec3 emission = material.emission;
+            if (fmaxf(emission.x, fmaxf(emission.y, emission.z)) <= 0.0f && material.emittance > 0.0f)
+            {
+                emission = material.color * material.emittance;
+            }
+            if (material.type == MATERIAL_EMISSIVE || fmaxf(emission.x, fmaxf(emission.y, emission.z)) > 0.0f) {
+                pathSegment.color *= emission;
                 pathSegment.remainingBounces = 0;
             }
             else {
@@ -388,14 +399,36 @@ __global__ void shadeBSDF(
                     }
                     break;
                 case MATERIAL_COOK_TORRANCE:
-                    scatterRoughSpecular(pathSegment, intersect, normal, 0.20f, rng);
-                    pathSegment.color *= roughSpecularThroughput(
-                        incoming, pathSegment.ray.direction, normal, material, 0.20f);
+                {
+                    // glTF's metallic-roughness model contains both a diffuse
+                    // dielectric lobe and a GGX specular lobe.  Choose one
+                    // lobe per bounce and compensate for that choice in the
+                    // throughput so the result remains an unbiased mixture.
+                    const float roughness = glm::clamp(material.roughness, 0.001f, 1.0f);
+                    const float metallic = glm::clamp(material.metallic, 0.0f, 1.0f);
+                    const glm::vec3 f0 = glm::mix(glm::vec3(0.04f), material.color, metallic);
+                    const float specularProbability = glm::clamp(
+                        fmaxf(f0.x, fmaxf(f0.y, f0.z)), 0.05f, 0.95f);
+                    thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
+                    if (u01(rng) < specularProbability)
+                    {
+                        scatterRoughSpecular(pathSegment, intersect, normal, roughness, rng);
+                        pathSegment.color *= roughSpecularThroughput(
+                            incoming, pathSegment.ray.direction, normal, material, roughness) /
+                            specularProbability;
+                    }
+                    else
+                    {
+                        pathSegment.color *= ((1.0f - metallic) * material.color) /
+                            (1.0f - specularProbability);
+                        scatterRay(pathSegment, intersect, normal, rng);
+                    }
                     break;
+                }
                 case MATERIAL_MICROFACETS:
-                    scatterRoughSpecular(pathSegment, intersect, normal, 0.45f, rng);
+                    scatterRoughSpecular(pathSegment, intersect, normal, material.roughness, rng);
                     pathSegment.color *= roughSpecularThroughput(
-                        incoming, pathSegment.ray.direction, normal, material, 0.45f);
+                        incoming, pathSegment.ray.direction, normal, material, material.roughness);
                     break;
                 case MATERIAL_DIFFUSE:
                 default:

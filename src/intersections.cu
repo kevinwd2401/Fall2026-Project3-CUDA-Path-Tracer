@@ -107,3 +107,75 @@ __host__ __device__ float sphereIntersectionTest(
 
     return glm::length(r.origin - intersectionPoint);
 }
+
+__host__ __device__ float triangleIntersectionTest(
+    Geom triangle,
+    Ray r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal,
+    bool& outside)
+{
+    // Moller-Trumbore in world space. glTF instances have already had their
+    // node transforms applied by the host loader, so t is directly compatible
+    // with the ray distances used by the rest of the kernel.
+    const glm::vec3& p0 = triangle.triangleVertices[0];
+    const glm::vec3& p1 = triangle.triangleVertices[1];
+    const glm::vec3& p2 = triangle.triangleVertices[2];
+    const glm::vec3 edge1 = p1 - p0;
+    const glm::vec3 edge2 = p2 - p0;
+    const glm::vec3 faceNormal = glm::cross(edge1, edge2);
+    if (glm::dot(faceNormal, faceNormal) < 1e-16f)
+    {
+        return -1.0f;
+    }
+
+    const glm::vec3 pvec = glm::cross(r.direction, edge2);
+    const float determinant = glm::dot(edge1, pvec);
+    if (fabsf(determinant) < 1e-8f)
+    {
+        return -1.0f;
+    }
+
+    const float inverseDeterminant = 1.0f / determinant;
+    const glm::vec3 tvec = r.origin - p0;
+    const float u = glm::dot(tvec, pvec) * inverseDeterminant;
+    if (u < 0.0f || u > 1.0f)
+    {
+        return -1.0f;
+    }
+
+    const glm::vec3 qvec = glm::cross(tvec, edge1);
+    const float v = glm::dot(r.direction, qvec) * inverseDeterminant;
+    if (v < 0.0f || u + v > 1.0f)
+    {
+        return -1.0f;
+    }
+
+    const float t = glm::dot(edge2, qvec) * inverseDeterminant;
+    if (t <= 1e-4f)
+    {
+        return -1.0f;
+    }
+
+    intersectionPoint = r.origin + t * r.direction;
+    if (triangle.hasVertexNormals)
+    {
+        const float w = 1.0f - u - v;
+        normal = w * triangle.triangleNormals[0] +
+            u * triangle.triangleNormals[1] + v * triangle.triangleNormals[2];
+        if (glm::dot(normal, normal) < 1e-16f)
+        {
+            normal = glm::normalize(faceNormal);
+        }
+        else
+        {
+            normal = glm::normalize(normal);
+        }
+    }
+    else
+    {
+        normal = glm::normalize(faceNormal);
+    }
+    outside = glm::dot(r.direction, normal) < 0.0f;
+    return t;
+}
