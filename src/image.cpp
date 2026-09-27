@@ -1,4 +1,5 @@
 #include "image.h"
+#include "tonemapping.h"
 
 #include <stb_image_write.h>
 
@@ -28,7 +29,7 @@ void Image::savePNG(const std::string &baseFilename)
         for (int x = 0; x < xSize; x++)
         {
             int i = y * xSize + x;
-            glm::vec3 pix = glm::clamp(pixels[i], glm::vec3(), glm::vec3(1)) * 255.f;
+            const glm::vec3 pix = acesFilmicTonemap(pixels[i]) * 255.0f;
             bytes[3 * i + 0] = (unsigned char) pix.x;
             bytes[3 * i + 1] = (unsigned char) pix.y;
             bytes[3 * i + 2] = (unsigned char) pix.z;

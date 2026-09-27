@@ -50,6 +50,7 @@ include_directories(${GLM_INCLUDE_DIRS})
 
 set(headers
     src/image.h
+    src/tonemapping.h
     src/interactions.h
     src/intersections.h
     src/glslUtility.hpp
