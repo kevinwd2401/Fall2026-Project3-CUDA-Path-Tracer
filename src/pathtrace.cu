@@ -84,6 +84,8 @@ static Scene* hst_scene = NULL;
 static GuiDataContainer* guiData = NULL;
 static glm::vec3* dev_image = NULL;
 static Geom* dev_geoms = NULL;
+static BVHNode* dev_bvhNodes = NULL;
+static int* dev_bvhPrimitiveIndices = NULL;
 static Material* dev_materials = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
@@ -111,6 +113,15 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_geoms, scene->geoms.size() * sizeof(Geom));
     cudaMemcpy(dev_geoms, scene->geoms.data(), scene->geoms.size() * sizeof(Geom), cudaMemcpyHostToDevice);
 
+    if (!scene->bvhNodes.empty())
+    {
+        cudaMalloc(&dev_bvhNodes, scene->bvhNodes.size() * sizeof(BVHNode));
+        cudaMemcpy(dev_bvhNodes, scene->bvhNodes.data(), scene->bvhNodes.size() * sizeof(BVHNode), cudaMemcpyHostToDevice);
+        cudaMalloc(&dev_bvhPrimitiveIndices, scene->bvhPrimitiveIndices.size() * sizeof(int));
+        cudaMemcpy(dev_bvhPrimitiveIndices, scene->bvhPrimitiveIndices.data(),
+            scene->bvhPrimitiveIndices.size() * sizeof(int), cudaMemcpyHostToDevice);
+    }
+
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
 
@@ -129,6 +140,8 @@ void pathtraceFree()
     cudaFree(dev_image);  // no-op if dev_image is null
     cudaFree(dev_paths);
     cudaFree(dev_geoms);
+    cudaFree(dev_bvhNodes);
+    cudaFree(dev_bvhPrimitiveIndices);
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
     cudaFree(dev_materialSortKeys);
@@ -201,7 +214,9 @@ __global__ void computeIntersections(
     int num_paths,
     PathSegment* pathSegments,
     Geom* geoms,
-    int geoms_size,
+    const BVHNode* bvhNodes,
+    int bvhNodeCount,
+    const int* bvhPrimitiveIndices,
     ShadeableIntersection* intersections)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -210,45 +225,62 @@ __global__ void computeIntersections(
     {
         PathSegment pathSegment = pathSegments[path_index];
 
-        float t;
-        glm::vec3 intersect_point;
         glm::vec3 normal;
         float t_min = FLT_MAX;
         int hit_geom_index = -1;
-        bool outside = true;
 
         glm::vec3 tmp_intersect;
         glm::vec3 tmp_normal;
 
-        // naive parse through global geoms
 
-        for (int i = 0; i < geoms_size; i++)
+        //bvh traversal
+        int nodeIndex = 0;
+        while (nodeIndex < bvhNodeCount)
         {
-            Geom& geom = geoms[i];
-            t = -1.0f;
-
-            if (geom.type == CUBE)
+            const BVHNode& node = bvhNodes[nodeIndex];
+            float boxEntryDistance;
+            if (!aabbIntersectionTest(pathSegment.ray, node.boundsMin, node.boundsMax,
+                t_min, boxEntryDistance))
             {
-                t = boxIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
-            }
-            else if (geom.type == SPHERE)
-            {
-                t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
-            }
-            else if (geom.type == TRIANGLE)
-            {
-                t = triangleIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                nodeIndex = node.escapeIndex;
+                continue;
             }
 
-            // Compute the minimum t from the intersection tests to determine what
-            // scene geometry object was hit first.
-            if (t > 0.0f && t_min > t)
+            if (node.primitiveCount == 0)
             {
-                t_min = t;
-                hit_geom_index = i;
-                intersect_point = tmp_intersect;
-                normal = tmp_normal;
+                // Nodes are stored depth-first, so the left child is next.
+                ++nodeIndex;
+                continue;
             }
+
+            for (int primitiveOffset = 0; primitiveOffset < node.primitiveCount; ++primitiveOffset)
+            {
+                const int geomIndex = bvhPrimitiveIndices[node.firstPrimitive + primitiveOffset];
+                const Geom& geom = geoms[geomIndex];
+                bool outside = true;
+                float t = -1.0f;
+
+                if (geom.type == CUBE)
+                {
+                    t = boxIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                }
+                else if (geom.type == SPHERE)
+                {
+                    t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                }
+                else if (geom.type == TRIANGLE)
+                {
+                    t = triangleIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                }
+
+                if (t > 0.0f && t_min > t)
+                {
+                    t_min = t;
+                    hit_geom_index = geomIndex;
+                    normal = tmp_normal;
+                }
+            }
+            nodeIndex = node.escapeIndex;
         }
 
         if (hit_geom_index == -1)
@@ -599,7 +631,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             num_paths,
             dev_paths,
             dev_geoms,
-            hst_scene->geoms.size(),
+            dev_bvhNodes,
+            static_cast<int>(hst_scene->bvhNodes.size()),
+            dev_bvhPrimitiveIndices,
             dev_intersections
         );
         checkCUDAError("trace one bounce");

@@ -52,6 +52,22 @@ struct Geom
     int hasVertexNormals;
 };
 
+// A flat, depth-first BVH node shared verbatim by the CPU builder and CUDA
+// traversal code.  Leaves have primitiveCount > 0 and reference a range in
+// Scene::bvhPrimitiveIndices.  Internal nodes have primitiveCount == 0.
+//
+// escapeIndex makes the tree stackless on the GPU: after a node (and all of
+// its descendants) has been considered, traversal continues at escapeIndex.
+// The root's escapeIndex is bvhNodes.size(), the traversal sentinel.
+struct BVHNode
+{
+    glm::vec3 boundsMin;
+    int firstPrimitive;
+    glm::vec3 boundsMax;
+    int primitiveCount;
+    int escapeIndex;
+};
+
 struct Material
 {
     glm::vec3 color;

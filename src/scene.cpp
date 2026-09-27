@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cfloat>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -31,6 +32,60 @@ constexpr uint32_t GLB_MAGIC = 0x46546C67;
 constexpr uint32_t GLB_JSON_CHUNK = 0x4E4F534A;
 constexpr uint32_t GLB_BIN_CHUNK = 0x004E4942;
 constexpr int GLTF_MODE_TRIANGLES = 4;
+constexpr int BVH_LEAF_SIZE = 4;
+constexpr int BVH_SAH_BINS = 16;
+
+struct Bounds
+{
+    glm::vec3 minimum = glm::vec3(FLT_MAX);
+    glm::vec3 maximum = glm::vec3(-FLT_MAX);
+
+    void grow(const glm::vec3& point)
+    {
+        minimum = glm::min(minimum, point);
+        maximum = glm::max(maximum, point);
+    }
+
+    void grow(const Bounds& other)
+    {
+        minimum = glm::min(minimum, other.minimum);
+        maximum = glm::max(maximum, other.maximum);
+    }
+
+    float surfaceArea() const
+    {
+        const glm::vec3 extent = glm::max(maximum - minimum, glm::vec3(0.0f));
+        return 2.0f * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x);
+    }
+};
+
+struct BVHBin
+{
+    Bounds bounds;
+    int count = 0;
+};
+
+Bounds boundsForGeom(const Geom& geom)
+{
+    Bounds bounds;
+    if (geom.type == TRIANGLE)
+    {
+        bounds.grow(geom.triangleVertices[0]);
+        bounds.grow(geom.triangleVertices[1]);
+        bounds.grow(geom.triangleVertices[2]);
+        return bounds;
+    }
+
+    for (int corner = 0; corner < 8; ++corner)
+    {
+        const glm::vec3 local(
+            (corner & 1) ? 0.5f : -0.5f,
+            (corner & 2) ? 0.5f : -0.5f,
+            (corner & 4) ? 0.5f : -0.5f);
+        bounds.grow(glm::vec3(geom.transform * glm::vec4(local, 1.0f)));
+    }
+    return bounds;
+}
 
 MaterialType parseMaterialType(const std::string& type)
 {
@@ -218,6 +273,7 @@ Scene::Scene(string filename)
     if (extension == ".json") loadFromJSON(filename);
     else if (extension == ".gltf" || extension == ".glb") loadFromGLTF(filename);
     else { cout << "Couldn't read from " << filename << endl; exit(-1); }
+    buildBVH();
 }
 
 void Scene::rebuildEmissivePrimitives()
@@ -228,6 +284,224 @@ void Scene::rebuildEmissivePrimitives()
         const int materialID = geoms[i].materialid;
         if (materialID >= 0 && materialID < static_cast<int>(materials.size()) && materialEmits(materials[materialID])) emissivePrimitives.push_back(static_cast<int>(i));
     }
+}
+
+void Scene::buildBVH()
+{
+    bvhNodes.clear();
+    bvhPrimitiveIndices.resize(geoms.size());
+    for (size_t i = 0; i < geoms.size(); ++i)
+    {
+        bvhPrimitiveIndices[i] = static_cast<int>(i);
+    }
+    if (geoms.empty()) return;
+
+    std::vector<Bounds> primitiveBounds(geoms.size());
+    std::vector<glm::vec3> primitiveCentroids(geoms.size());
+    for (size_t i = 0; i < geoms.size(); ++i)
+    {
+        primitiveBounds[i] = boundsForGeom(geoms[i]);
+        primitiveCentroids[i] = 0.5f * (primitiveBounds[i].minimum + primitiveBounds[i].maximum);
+    }
+
+    const auto makeLeaf = [&](int nodeIndex, int begin, int end, const Bounds& bounds) {
+        BVHNode& node = bvhNodes[nodeIndex];
+        node.boundsMin = bounds.minimum;
+        node.boundsMax = bounds.maximum;
+        node.firstPrimitive = begin;
+        node.primitiveCount = end - begin;
+        node.escapeIndex = nodeIndex + 1;
+    };
+
+    std::function<int(int, int)> buildNode = [&](int begin, int end) -> int {
+        Bounds nodeBounds;
+        Bounds centroidBounds;
+        for (int i = begin; i < end; ++i)
+        {
+            const int primitiveIndex = bvhPrimitiveIndices[i];
+            nodeBounds.grow(primitiveBounds[primitiveIndex]);
+            centroidBounds.grow(primitiveCentroids[primitiveIndex]);
+        }
+
+        const int nodeIndex = static_cast<int>(bvhNodes.size());
+        bvhNodes.push_back(BVHNode{});
+        const int primitiveCount = end - begin;
+        if (primitiveCount <= BVH_LEAF_SIZE)
+        {
+            makeLeaf(nodeIndex, begin, end, nodeBounds);
+            return nodeIndex;
+        }
+
+        // Multiplying the usual SAH equation by parent area avoids a divide:
+        // leaf = N * parentArea; split = parentArea + NL * AL + NR * AR.
+        float bestCost = nodeBounds.surfaceArea() * primitiveCount;
+        int bestAxis = -1;
+        int bestSplit = -1;
+
+        // TODO (BVH study block): Change BVH_SAH_BINS and observe how the
+        // chosen tree and render time change.  This is binned SAH: each
+        // candidate cost is parentArea + area(left) * count(left) +
+        // area(right) * count(right).
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            const float extent = centroidBounds.maximum[axis] - centroidBounds.minimum[axis];
+            if (extent <= 1e-6f) continue;
+
+            BVHBin bins[BVH_SAH_BINS];
+            const float inverseExtent = static_cast<float>(BVH_SAH_BINS) / extent;
+            for (int i = begin; i < end; ++i)
+            {
+                const int primitiveIndex = bvhPrimitiveIndices[i];
+                const int bin = std::min(BVH_SAH_BINS - 1,
+                    static_cast<int>((primitiveCentroids[primitiveIndex][axis] - centroidBounds.minimum[axis]) * inverseExtent));
+                ++bins[bin].count;
+                bins[bin].bounds.grow(primitiveBounds[primitiveIndex]);
+            }
+
+            Bounds leftBounds[BVH_SAH_BINS];
+            Bounds rightBounds[BVH_SAH_BINS];
+            int leftCounts[BVH_SAH_BINS]{};
+            int rightCounts[BVH_SAH_BINS]{};
+            Bounds runningLeft;
+            Bounds runningRight;
+            int leftCount = 0;
+            int rightCount = 0;
+            for (int bin = 0; bin < BVH_SAH_BINS; ++bin)
+            {
+                if (bins[bin].count > 0) runningLeft.grow(bins[bin].bounds);
+                leftCount += bins[bin].count;
+                leftBounds[bin] = runningLeft;
+                leftCounts[bin] = leftCount;
+
+                const int reverseBin = BVH_SAH_BINS - 1 - bin;
+                if (bins[reverseBin].count > 0) runningRight.grow(bins[reverseBin].bounds);
+                rightCount += bins[reverseBin].count;
+                rightBounds[reverseBin] = runningRight;
+                rightCounts[reverseBin] = rightCount;
+            }
+
+            for (int split = 0; split < BVH_SAH_BINS - 1; ++split)
+            {
+                if (leftCounts[split] == 0 || rightCounts[split + 1] == 0) continue;
+                const float splitCost = nodeBounds.surfaceArea() +
+                    leftBounds[split].surfaceArea() * leftCounts[split] +
+                    rightBounds[split + 1].surfaceArea() * rightCounts[split + 1];
+                if (splitCost < bestCost)
+                {
+                    bestCost = splitCost;
+                    bestAxis = axis;
+                    bestSplit = split;
+                }
+            }
+        }
+
+        if (bestAxis < 0)
+        {
+            // All centroids coincide, so no spatial split is meaningful.
+            makeLeaf(nodeIndex, begin, end, nodeBounds);
+            return nodeIndex;
+        }
+
+        const float axisMinimum = centroidBounds.minimum[bestAxis];
+        const float inverseExtent = static_cast<float>(BVH_SAH_BINS) /
+            (centroidBounds.maximum[bestAxis] - axisMinimum);
+        const auto middle = std::partition(
+            bvhPrimitiveIndices.begin() + begin,
+            bvhPrimitiveIndices.begin() + end,
+            [&](int primitiveIndex) {
+                const int bin = std::min(BVH_SAH_BINS - 1,
+                    static_cast<int>((primitiveCentroids[primitiveIndex][bestAxis] - axisMinimum) * inverseExtent));
+                return bin <= bestSplit;
+            });
+        const int mid = static_cast<int>(middle - bvhPrimitiveIndices.begin());
+        if (mid == begin || mid == end)
+        {
+            // Numerical edge cases should not make an empty child.  A median
+            // split preserves a finite, balanced construction in that case.
+            const int fallbackMid = begin + primitiveCount / 2;
+            std::nth_element(bvhPrimitiveIndices.begin() + begin,
+                bvhPrimitiveIndices.begin() + fallbackMid,
+                bvhPrimitiveIndices.begin() + end,
+                [&](int a, int b) { return primitiveCentroids[a][bestAxis] < primitiveCentroids[b][bestAxis]; });
+            const int leftRoot = buildNode(begin, fallbackMid);
+            const int rightRoot = buildNode(fallbackMid, end);
+            bvhNodes[leftRoot].escapeIndex = rightRoot;
+        }
+        else
+        {
+            const int leftRoot = buildNode(begin, mid);
+            const int rightRoot = buildNode(mid, end);
+            bvhNodes[leftRoot].escapeIndex = rightRoot;
+        }
+
+        BVHNode& node = bvhNodes[nodeIndex];
+        node.boundsMin = nodeBounds.minimum;
+        node.boundsMax = nodeBounds.maximum;
+        node.firstPrimitive = -1;
+        node.primitiveCount = 0;
+        node.escapeIndex = static_cast<int>(bvhNodes.size());
+        return nodeIndex;
+    };
+
+    buildNode(0, static_cast<int>(bvhPrimitiveIndices.size()));
+    cout << "Built SAH BVH with " << bvhNodes.size() << " nodes for " << geoms.size() << " primitives." << endl;
+
+
+    // debugging statements.
+    int leafCount = 0;
+    int internalCount = 0;
+    int minimumLeafSize = static_cast<int>(geoms.size());
+    int maximumLeafSize = 0;
+    int totalLeafPrimitives = 0;
+    for (const BVHNode& node : bvhNodes)
+    {
+        if (node.primitiveCount == 0)
+        {
+            ++internalCount;
+            continue;
+        }
+        ++leafCount;
+        minimumLeafSize = std::min(minimumLeafSize, node.primitiveCount);
+        maximumLeafSize = std::max(maximumLeafSize, node.primitiveCount);
+        totalLeafPrimitives += node.primitiveCount;
+    }
+
+    int maximumDepth = 0;
+    std::function<void(int, int)> measureDepth = [&](int nodeIndex, int depth) {
+        maximumDepth = std::max(maximumDepth, depth);
+        const BVHNode& node = bvhNodes[nodeIndex];
+        if (node.primitiveCount > 0) return;
+        const int leftChild = nodeIndex + 1;
+        const int rightChild = bvhNodes[leftChild].escapeIndex;
+        measureDepth(leftChild, depth + 1);
+        measureDepth(rightChild, depth + 1);
+    };
+    measureDepth(0, 0);
+
+    const Bounds rootBounds{ bvhNodes[0].boundsMin, bvhNodes[0].boundsMax };
+    const float rootArea = rootBounds.surfaceArea();
+    std::function<float(int)> estimateSAHCost = [&](int nodeIndex) -> float {
+        const BVHNode& node = bvhNodes[nodeIndex];
+        if (node.primitiveCount > 0) return static_cast<float>(node.primitiveCount);
+        const int leftChild = nodeIndex + 1;
+        const int rightChild = bvhNodes[leftChild].escapeIndex;
+        const float nodeArea = Bounds{ node.boundsMin, node.boundsMax }.surfaceArea();
+        if (nodeArea <= 0.0f) return static_cast<float>(geoms.size());
+        const float leftArea = Bounds{ bvhNodes[leftChild].boundsMin, bvhNodes[leftChild].boundsMax }.surfaceArea();
+        const float rightArea = Bounds{ bvhNodes[rightChild].boundsMin, bvhNodes[rightChild].boundsMax }.surfaceArea();
+        return 1.0f + (leftArea / nodeArea) * estimateSAHCost(leftChild) +
+            (rightArea / nodeArea) * estimateSAHCost(rightChild);
+    };
+
+    cout << "  internal nodes: " << internalCount << ", leaves: " << leafCount
+         << ", maximum depth: " << maximumDepth << endl;
+    cout << "  leaf primitives (min/avg/max): " << minimumLeafSize << " / "
+         << static_cast<float>(totalLeafPrimitives) / leafCount << " / " << maximumLeafSize << endl;
+    cout << "  root bounds: min(" << rootBounds.minimum.x << ", " << rootBounds.minimum.y << ", " << rootBounds.minimum.z
+         << ") max(" << rootBounds.maximum.x << ", " << rootBounds.maximum.y << ", " << rootBounds.maximum.z
+         << "), surface area: " << rootArea << endl;
+    cout << "  estimated SAH traversal cost: " << estimateSAHCost(0)
+         << " (linear baseline: " << geoms.size() << " primitive tests)" << endl;
 }
 
 void Scene::loadFromJSON(const std::string& jsonName)
@@ -343,10 +617,13 @@ void Scene::loadFromGLTF(const std::string& gltfName)
             // Prefer the former when it is available so imported PBRT Cornell
             // scenes retain their intended lighting intensity.
             const json extras = definition.value("extras", json::object());
+            const json pbrt = extras.value("pbrt", json::object());
+            const bool isPbrtDielectric = pbrt.is_object() &&
+                lowercase(pbrt.value("type", string())) == "dielectric";
             bool hasPbrtAreaLightRadiance = false;
-            if (extras.contains("pbrt") && extras.at("pbrt").contains("area_light_radiance_rgb"))
+            if (pbrt.is_object() && pbrt.contains("area_light_radiance_rgb"))
             {
-                const json& radiance = extras.at("pbrt").at("area_light_radiance_rgb");
+                const json& radiance = pbrt.at("area_light_radiance_rgb");
                 if (radiance.is_array() && radiance.size() >= 3)
                 {
                     material.emission = glm::vec3(radiance.at(0).get<float>(),
@@ -358,10 +635,24 @@ void Scene::loadFromGLTF(const std::string& gltfName)
                     cerr << "Warning: ignoring malformed pbrt area-light radiance for material " << materialIDs.size() << endl;
                 }
             }
+            if (isPbrtDielectric && pbrt.contains("eta"))
+            {
+                const float eta = pbrt.value("eta", material.indexOfRefraction);
+                if (eta > 0.0f) material.indexOfRefraction = eta;
+                else cerr << "Warning: ignoring non-positive PBRT eta for material " << materialIDs.size() << endl;
+            }
+            // Standard glTF material extensions take precedence when both
+            // formats provide the same property.
             if (extensions.contains("KHR_materials_ior")) material.indexOfRefraction = extensions.at("KHR_materials_ior").value("ior", material.indexOfRefraction);
             if (!hasPbrtAreaLightRadiance && extensions.contains("KHR_materials_emissive_strength")) material.emission *= extensions.at("KHR_materials_emissive_strength").value("emissiveStrength", 1.0f);
             if (maxComponent(material.emission) > 0.0f) material.type = MATERIAL_EMISSIVE;
-            else if (extensions.contains("KHR_materials_transmission") && extensions.at("KHR_materials_transmission").value("transmissionFactor", 0.0f) > 0.0f) material.type = MATERIAL_DIELECTRIC;
+            else if (isPbrtDielectric ||
+                (extensions.contains("KHR_materials_transmission") && extensions.at("KHR_materials_transmission").value("transmissionFactor", 0.0f) > 0.0f))
+            {
+                material.type = MATERIAL_DIELECTRIC;
+                cout << "Imported dielectric material '" << definition.value("name", "<unnamed>")
+                     << "' with IOR " << material.indexOfRefraction << endl;
+            }
             if (pbr.contains("baseColorTexture")) cerr << "Warning: glTF baseColorTexture is ignored for material " << materialIDs.size() << endl;
             materialIDs.push_back(static_cast<int>(materials.size())); materials.push_back(material);
         }

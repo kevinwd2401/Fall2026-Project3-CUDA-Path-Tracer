@@ -38,6 +38,45 @@ __host__ __device__ inline glm::vec3 multiplyMV(glm::mat4 m, glm::vec4 v)
     return glm::vec3(m * v);
 }
 
+/**
+ * Intersect a world-space axis-aligned bounding box.  maxDistance is the
+ * nearest primitive hit already found, so nodes farther than it can be
+ * skipped during BVH traversal.
+ */
+__host__ __device__ inline bool aabbIntersectionTest(
+    const Ray& ray,
+    const glm::vec3& boundsMin,
+    const glm::vec3& boundsMax,
+    float maxDistance,
+    float& entryDistance)
+{
+    float tNear = -1.0e30f;
+    float tFar = maxDistance;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        const float origin = ray.origin[axis];
+        const float direction = ray.direction[axis];
+        if (fabsf(direction) < 1e-8f)
+        {
+            if (origin < boundsMin[axis] || origin > boundsMax[axis]) return false;
+            continue;
+        }
+        float t0 = (boundsMin[axis] - origin) / direction;
+        float t1 = (boundsMax[axis] - origin) / direction;
+        if (t0 > t1)
+        {
+            const float temporary = t0;
+            t0 = t1;
+            t1 = temporary;
+        }
+        tNear = glm::max(tNear, t0);
+        tFar = glm::min(tFar, t1);
+        if (tNear > tFar) return false;
+    }
+    entryDistance = glm::max(tNear, 0.0f);
+    return tFar >= 0.0f;
+}
+
 // CHECKITOUT
 /**
  * Test intersection between a ray and a transformed cube. Untransformed,
