@@ -357,14 +357,15 @@ int main(int argc, char** argv)
 
     if (argc < 2)
     {
-        printf("Usage: %s SCENEFILE.(json|gltf|glb)\n", argv[0]);
+        printf("Usage: %s SCENEFILE.(json|gltf|glb) [HDRI_FILE]\n", argv[0]);
         return 1;
     }
 
     const char* sceneFile = argv[1];
+    const char* environmentFile = argc >= 3 ? argv[2] : nullptr;
 
     // Load scene file
-    scene = new Scene(sceneFile);
+    scene = new Scene(sceneFile, environmentFile ? environmentFile : "");
 
     //Create Instance for ImGUIData
     guiData = new GuiDataContainer();

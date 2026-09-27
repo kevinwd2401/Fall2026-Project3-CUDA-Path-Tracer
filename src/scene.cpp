@@ -6,6 +6,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include "json.hpp"
+#include <stb_image.h>
 
 #include <algorithm>
 #include <cctype>
@@ -266,14 +267,95 @@ glm::mat4 getNodeTransform(const json& node)
 }
 }
 
-Scene::Scene(string filename)
+Scene::Scene(string filename, string environmentFilename)
 {
     cout << "Reading scene from " << filename << " ..." << endl << " " << endl;
     const string extension = lowercase(filesystem::path(filename).extension().string());
     if (extension == ".json") loadFromJSON(filename);
     else if (extension == ".gltf" || extension == ".glb") loadFromGLTF(filename);
     else { cout << "Couldn't read from " << filename << endl; exit(-1); }
+    if (!environmentFilename.empty()) loadEnvironmentMap(environmentFilename);
     buildBVH();
+}
+
+void Scene::loadEnvironmentMap(const string& filename)
+{
+    int width = 0;
+    int height = 0;
+    int sourceChannels = 0;
+    float* pixels = stbi_loadf(filename.c_str(), &width, &height, &sourceChannels, 3);
+    if (pixels == nullptr || width <= 0 || height <= 0)
+    {
+        const string reason = stbi_failure_reason() ? stbi_failure_reason() : "unknown image loading error";
+        if (pixels) stbi_image_free(pixels);
+        throw runtime_error("could not load HDRI environment map '" + filename + "': " + reason);
+    }
+
+    environment.width = width;
+    environment.height = height;
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    environment.texels.resize(pixelCount);
+    environment.cdf.resize(pixelCount);
+    environment.pdfSolidAngle.resize(pixelCount);
+
+    // Each texel represents a different solid angle in latitude-longitude
+    // space.  Weighting luminance by that angle makes the distribution a PDF
+    // over directions rather than a PDF over image pixels.
+    vector<float> weights(pixelCount);
+    double totalWeight = 0.0;
+    const float deltaPhi = TWO_PI / static_cast<float>(width);
+    for (int y = 0; y < height; ++y)
+    {
+        const float theta0 = PI * static_cast<float>(y) / static_cast<float>(height);
+        const float theta1 = PI * static_cast<float>(y + 1) / static_cast<float>(height);
+        const float texelSolidAngle = deltaPhi * (cosf(theta0) - cosf(theta1));
+        for (int x = 0; x < width; ++x)
+        {
+            const size_t index = static_cast<size_t>(y) * width + x;
+            const float* pixel = pixels + index * 3;
+            const glm::vec3 color(fmaxf(0.0f, pixel[0]), fmaxf(0.0f, pixel[1]), fmaxf(0.0f, pixel[2]));
+            environment.texels[index] = color;
+            const float luminance = glm::dot(color, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+            weights[index] = luminance * texelSolidAngle;
+            totalWeight += weights[index];
+        }
+    }
+    stbi_image_free(pixels);
+
+    // A black map has no meaningful luminance distribution.  Fall back to a
+    // uniform-sphere distribution so its PDF is still valid and finite.
+    if (totalWeight <= 0.0)
+    {
+        totalWeight = 0.0;
+        for (int y = 0; y < height; ++y)
+        {
+            const float theta0 = PI * static_cast<float>(y) / static_cast<float>(height);
+            const float theta1 = PI * static_cast<float>(y + 1) / static_cast<float>(height);
+            const float texelSolidAngle = deltaPhi * (cosf(theta0) - cosf(theta1));
+            for (int x = 0; x < width; ++x)
+            {
+                const size_t index = static_cast<size_t>(y) * width + x;
+                weights[index] = texelSolidAngle;
+                totalWeight += weights[index];
+            }
+        }
+    }
+
+    double cumulativeWeight = 0.0;
+    for (size_t index = 0; index < pixelCount; ++index)
+    {
+        cumulativeWeight += weights[index];
+        environment.cdf[index] = static_cast<float>(cumulativeWeight / totalWeight);
+        const int y = static_cast<int>(index / width);
+        const float theta0 = PI * static_cast<float>(y) / static_cast<float>(height);
+        const float theta1 = PI * static_cast<float>(y + 1) / static_cast<float>(height);
+        const float texelSolidAngle = deltaPhi * (cosf(theta0) - cosf(theta1));
+        environment.pdfSolidAngle[index] = texelSolidAngle > 0.0f ?
+            weights[index] / static_cast<float>(totalWeight) / texelSolidAngle : 0.0f;
+    }
+    environment.cdf.back() = 1.0f;
+    cout << "Loaded HDRI environment map " << filename << " (" << width << "x" << height
+         << ", importance sampled)." << endl;
 }
 
 void Scene::rebuildEmissivePrimitives()

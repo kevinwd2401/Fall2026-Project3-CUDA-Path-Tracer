@@ -91,6 +91,25 @@ static int* dev_bvhPrimitiveIndices = NULL;
 static Material* dev_materials = NULL;
 static int* dev_lightPrimitives = NULL;
 static int dev_lightPrimitiveCount = 0;
+static glm::vec3* dev_environmentTexels = NULL;
+static float* dev_environmentCdf = NULL;
+static float* dev_environmentPdfSolidAngle = NULL;
+
+struct DeviceEnvironmentMap
+{
+    const glm::vec3* texels = NULL;
+    const float* cdf = NULL;
+    const float* pdfSolidAngle = NULL;
+    int width = 0;
+    int height = 0;
+
+    __host__ __device__ bool valid() const
+    {
+        return texels != NULL && cdf != NULL && pdfSolidAngle != NULL && width > 0 && height > 0;
+    }
+};
+
+static DeviceEnvironmentMap dev_environment;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 static int* dev_materialSortKeys = NULL;
@@ -137,12 +156,26 @@ void pathtraceInit(Scene* scene)
             dev_lightPrimitiveCount * sizeof(int), cudaMemcpyHostToDevice);
     }
 
+    if (scene->environment.valid())
+    {
+        const size_t environmentPixelCount = scene->environment.texels.size();
+        cudaMalloc(&dev_environmentTexels, environmentPixelCount * sizeof(glm::vec3));
+        cudaMalloc(&dev_environmentCdf, environmentPixelCount * sizeof(float));
+        cudaMalloc(&dev_environmentPdfSolidAngle, environmentPixelCount * sizeof(float));
+        cudaMemcpy(dev_environmentTexels, scene->environment.texels.data(),
+            environmentPixelCount * sizeof(glm::vec3), cudaMemcpyHostToDevice);
+        cudaMemcpy(dev_environmentCdf, scene->environment.cdf.data(),
+            environmentPixelCount * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(dev_environmentPdfSolidAngle, scene->environment.pdfSolidAngle.data(),
+            environmentPixelCount * sizeof(float), cudaMemcpyHostToDevice);
+        dev_environment = { dev_environmentTexels, dev_environmentCdf, dev_environmentPdfSolidAngle,
+            scene->environment.width, scene->environment.height };
+    }
+
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
     cudaMalloc(&dev_materialSortKeys, pixelcount * sizeof(int));
-
-    // TODO: initialize any extra device memeory you need
 
     checkCUDAError("pathtraceInit");
 }
@@ -156,9 +189,15 @@ void pathtraceFree()
     cudaFree(dev_bvhPrimitiveIndices);
     cudaFree(dev_materials);
     cudaFree(dev_lightPrimitives);
+    cudaFree(dev_environmentTexels);
+    cudaFree(dev_environmentCdf);
+    cudaFree(dev_environmentPdfSolidAngle);
     cudaFree(dev_intersections);
     cudaFree(dev_materialSortKeys);
-    // TODO: clean up any extra device memory you created
+    dev_environmentTexels = NULL;
+    dev_environmentCdf = NULL;
+    dev_environmentPdfSolidAngle = NULL;
+    dev_environment = DeviceEnvironmentMap{};
 
     checkCUDAError("pathtraceFree");
 }
@@ -543,6 +582,73 @@ __device__ float lightPdfSolidAngle(const Geom& light, const glm::vec3& referenc
         (lightCosine * static_cast<float>(lightCount)) : 0.0f;
 }
 
+// Lookup and sampling: Equirectangular maps use +Y at the top edge, and wrap around the X/Z axis.
+__device__ int environmentTexelIndex(const DeviceEnvironmentMap& environment,
+    const glm::vec3& direction)
+{
+    const glm::vec3 normalizedDirection = glm::normalize(direction);
+    float u = atan2f(normalizedDirection.z, normalizedDirection.x) / TWO_PI + 0.5f;
+    u -= floorf(u);
+    const float v = acosf(glm::clamp(normalizedDirection.y, -1.0f, 1.0f)) / PI;
+    const int x = min(environment.width - 1, static_cast<int>(u * environment.width));
+    const int y = min(environment.height - 1, static_cast<int>(v * environment.height));
+    return y * environment.width + x;
+}
+
+__device__ glm::vec3 environmentRadiance(const DeviceEnvironmentMap& environment,
+    const glm::vec3& direction)
+{
+    return environment.valid() ? environment.texels[environmentTexelIndex(environment, direction)] :
+        glm::vec3(0.0f);
+}
+
+__device__ float environmentPdf(const DeviceEnvironmentMap& environment,
+    const glm::vec3& direction)
+{
+    return environment.valid() ? environment.pdfSolidAngle[environmentTexelIndex(environment, direction)] : 0.0f;
+}
+
+struct EnvironmentSample
+{
+    glm::vec3 direction;
+    glm::vec3 radiance;
+    float pdfSolidAngle;
+    bool valid;
+};
+
+__device__ EnvironmentSample sampleEnvironment(const DeviceEnvironmentMap& environment,
+    thrust::default_random_engine& rng)
+{
+    EnvironmentSample sample{};
+    sample.valid = false;
+    if (!environment.valid()) return sample;
+
+    thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
+    const float chooseTexel = fminf(u01(rng), 0.99999994f);
+    int low = 0;
+    int high = environment.width * environment.height - 1;
+    while (low < high)
+    {
+        const int middle = low + (high - low) / 2;
+        if (environment.cdf[middle] >= chooseTexel) high = middle;
+        else low = middle + 1;
+    }
+
+    const int texelIndex = low;
+    const int x = texelIndex % environment.width;
+    const int y = texelIndex / environment.width;
+    const float u = (static_cast<float>(x) + u01(rng)) / static_cast<float>(environment.width);
+    const float v = (static_cast<float>(y) + u01(rng)) / static_cast<float>(environment.height);
+    const float phi = TWO_PI * (u - 0.5f);
+    const float theta = PI * v;
+    const float sinTheta = sinf(theta);
+    sample.direction = glm::vec3(cosf(phi) * sinTheta, cosf(theta), sinf(phi) * sinTheta);
+    sample.radiance = environment.texels[texelIndex];
+    sample.pdfSolidAngle = environment.pdfSolidAngle[texelIndex];
+    sample.valid = sample.pdfSolidAngle > 0.0f;
+    return sample;
+}
+
 __device__ bool isOccluded(const Ray& ray, float maxDistance, const Geom* geoms,
     const BVHNode* bvhNodes, int bvhNodeCount, const int* bvhPrimitiveIndices)
 {
@@ -646,16 +752,40 @@ __device__ float bsdfPdf(const Material& material, const glm::vec3& incoming,
 
 __device__ glm::vec3 estimateDirectLighting(const Material& material, const PathSegment& pathSegment,
     const glm::vec3& intersectionPoint, const glm::vec3& normal, const Geom* geoms,
-    const Material* materials, const int* lightPrimitives, int lightCount, const BVHNode* bvhNodes,
+    const Material* materials, const int* lightPrimitives, int emissiveLightCount,
+    const DeviceEnvironmentMap& environment, int totalLightCount, const BVHNode* bvhNodes,
     int bvhNodeCount, const int* bvhPrimitiveIndices, thrust::default_random_engine& rng)
 {
-    if (lightCount <= 0) return glm::vec3(0.0f);
-    thrust::uniform_int_distribution<int> chooseLight(0, lightCount - 1);
-    const Geom& light = geoms[lightPrimitives[chooseLight(rng)]];
+    if (totalLightCount <= 0) return glm::vec3(0.0f);
+    thrust::uniform_int_distribution<int> chooseLight(0, totalLightCount - 1);
+    const int chosenLight = chooseLight(rng);
+    const glm::vec3 offsetNormal = glm::dot(pathSegment.ray.direction, normal) < 0.0f ? normal : -normal;
+
+    if (chosenLight == emissiveLightCount)
+    {
+        const EnvironmentSample sample = sampleEnvironment(environment, rng);
+        if (!sample.valid) return glm::vec3(0.0f);
+        const float cosSurface = fmaxf(0.0f, glm::dot(offsetNormal, sample.direction));
+        if (cosSurface <= 0.0f) return glm::vec3(0.0f);
+        const Ray shadowRay{ intersectionPoint + 0.001f * offsetNormal, sample.direction };
+        if (isOccluded(shadowRay, FLT_MAX, geoms, bvhNodes, bvhNodeCount, bvhPrimitiveIndices))
+            return glm::vec3(0.0f);
+        const float lightPdf = sample.pdfSolidAngle / static_cast<float>(totalLightCount);
+        const float scatteringPdf = bsdfPdf(material, pathSegment.ray.direction, sample.direction, normal);
+        if (lightPdf <= EPSILON) return glm::vec3(0.0f);
+        const float lightPdf2 = lightPdf * lightPdf;
+        const float misWeight = lightPdf2 / (lightPdf2 + scatteringPdf * scatteringPdf);
+        return evaluateDirectBSDF(material, pathSegment.ray.direction, sample.direction, normal) *
+            sample.radiance * (cosSurface * misWeight / lightPdf);
+    }
+
+    // The only non-geometry entry is the environment entry immediately after
+    // the emissive primitives, so a valid selection below is always a surface.
+    if (chosenLight >= emissiveLightCount) return glm::vec3(0.0f);
+    const Geom& light = geoms[lightPrimitives[chosenLight]];
     const LightSurfaceSample sample = sampleLightSurface(light, rng);
     if (!sample.valid) return glm::vec3(0.0f);
 
-    const glm::vec3 offsetNormal = glm::dot(pathSegment.ray.direction, normal) < 0.0f ? normal : -normal;
     const glm::vec3 shadowOrigin = intersectionPoint + 0.001f * offsetNormal;
     const glm::vec3 toLight = sample.position - shadowOrigin;
     const float distance2 = glm::dot(toLight, toLight);
@@ -673,7 +803,7 @@ __device__ glm::vec3 estimateDirectLighting(const Material& material, const Path
         return glm::vec3(0.0f);
 
     const float lightPdf = distance2 * sample.pdfArea /
-        (cosLight * static_cast<float>(lightCount));
+        (cosLight * static_cast<float>(totalLightCount));
     const float scatteringPdf = bsdfPdf(material, pathSegment.ray.direction, wi, normal);
     if (lightPdf <= EPSILON) return glm::vec3(0.0f);
     const float lightPdf2 = lightPdf * lightPdf;
@@ -692,6 +822,8 @@ __global__ void shadeBSDF(
     Material* materials,
     const Geom* geoms,
     const int* lightPrimitives,
+    int emissiveLightCount,
+    DeviceEnvironmentMap environment,
     int lightCount,
     const BVHNode* bvhNodes,
     int bvhNodeCount,
@@ -748,7 +880,8 @@ __global__ void shadeBSDF(
                 if (material.type != MATERIAL_MIRROR && material.type != MATERIAL_DIELECTRIC)
                 {
                     pathSegment.radiance += pathSegment.color * estimateDirectLighting(material,
-                        pathSegment, intersect, normal, geoms, materials, lightPrimitives, lightCount,
+                        pathSegment, intersect, normal, geoms, materials, lightPrimitives, emissiveLightCount,
+                        environment, lightCount,
                         bvhNodes, bvhNodeCount, bvhPrimitiveIndices, rng);
                 }
                 switch (material.type)
@@ -855,8 +988,22 @@ __global__ void shadeBSDF(
             pathSegments[idx] = pathSegment;
         }
         else {
-            pathSegments[idx].color = glm::vec3(0.0f);
-            pathSegments[idx].remainingBounces = 0;
+            PathSegment pathSegment = pathSegments[idx];
+            if (environment.valid())
+            {
+                float misWeight = 1.0f;
+                if (!pathSegment.previousBounceWasSpecular && pathSegment.previousBsdfPdf > 0.0f)
+                {
+                    const float lightPdf = environmentPdf(environment, pathSegment.ray.direction) /
+                        static_cast<float>(lightCount);
+                    const float bsdfPdf2 = pathSegment.previousBsdfPdf * pathSegment.previousBsdfPdf;
+                    misWeight = bsdfPdf2 / (bsdfPdf2 + lightPdf * lightPdf);
+                }
+                pathSegment.radiance += pathSegment.color *
+                    environmentRadiance(environment, pathSegment.ray.direction) * misWeight;
+            }
+            pathSegment.remainingBounces = 0;
+            pathSegments[idx] = pathSegment;
 		}
     }
 }
@@ -937,6 +1084,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
     // 1D block for path tracing
     const int blockSize1d = 128;
+    const int totalLightCount = dev_lightPrimitiveCount + (dev_environment.valid() ? 1 : 0);
 
     ///////////////////////////////////////////////////////////////////////////
 
@@ -1040,6 +1188,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_geoms,
             dev_lightPrimitives,
             dev_lightPrimitiveCount,
+            dev_environment,
+            totalLightCount,
             dev_bvhNodes,
             static_cast<int>(hst_scene->bvhNodes.size()),
             dev_bvhPrimitiveIndices
