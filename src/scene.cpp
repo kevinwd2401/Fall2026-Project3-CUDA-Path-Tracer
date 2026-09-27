@@ -520,7 +520,7 @@ void Scene::loadFromJSON(const std::string& jsonName)
         material.emission = material.color * material.emittance;
         material.indexOfRefraction = p.value("IOR", p.value("INDEX_OF_REFRACTION", 1.55f));
         material.metallic = p.value("METALLIC", (material.type == MATERIAL_COOK_TORRANCE || material.type == MATERIAL_MICROFACETS) ? 1.0f : 0.0f);
-        const float oldRoughness = material.type == MATERIAL_MICROFACETS ? 0.45f : (material.type == MATERIAL_COOK_TORRANCE ? 0.20f : 1.0f);
+        const float oldRoughness = material.type == MATERIAL_MICROFACETS ? 0.2f : (material.type == MATERIAL_COOK_TORRANCE ? 0.20f : 1.0f);
         material.roughness = glm::clamp(p.value("ROUGHNESS", oldRoughness), 0.001f, 1.0f);
         materialNames[item.key()] = static_cast<uint32_t>(materials.size());
         materials.push_back(material);

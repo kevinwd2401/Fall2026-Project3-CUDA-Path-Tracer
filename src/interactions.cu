@@ -128,7 +128,7 @@ __device__ glm::vec3 sampleTrowbridgeReitzWh(const glm::vec3& wo, float roughnes
     return sameHemisphere(wo, wh) ? wh : -wh;
 }
 
-__device__ void scatterRoughSpecular(
+__device__ bool scatterRoughSpecular(
     PathSegment& pathSegment,
     const glm::vec3& intersect,
     glm::vec3 normal,
@@ -146,15 +146,16 @@ __device__ void scatterRoughSpecular(
     if (wo.z == 0.0f)
     {
         scatterMirror(pathSegment, intersect, normal);
-        return;
+        return false;
     }
 
     glm::vec3 wh = sampleTrowbridgeReitzWh(wo, roughness, rng);
     glm::vec3 wi = glm::reflect(-wo, wh);
+    pathSegment.ray.direction = localToWorld(normal, wi);
+    pathSegment.ray.origin = intersect + 0.001f * pathSegment.ray.direction;
     if (!sameHemisphere(wo, wi))
     {
-        scatterMirror(pathSegment, intersect, normal);
-        return;
+        return false;
     }
 
     float cosThetaO = absCosTheta(wo);
@@ -162,12 +163,10 @@ __device__ void scatterRoughSpecular(
     float woDotWh = fabsf(glm::dot(wo, wh));
     if (cosThetaI <= 0.0f || cosThetaO <= 0.0f || woDotWh <= 0.0f)
     {
-        scatterMirror(pathSegment, intersect, normal);
-        return;
+        return false;
     }
 
-    pathSegment.ray.direction = localToWorld(normal, wi);
-    pathSegment.ray.origin = intersect + 0.001f * pathSegment.ray.direction;
+    return true;
 }
 
 // Returns the unpolarized Fresnel reflectance for an interface from etaI to

@@ -373,7 +373,9 @@ __device__ glm::vec3 roughSpecularThroughput(
 
     glm::vec3 wo = bsdfWorldToLocal(normal, -incoming);
     const float metallic = glm::clamp(material.metallic, 0.0f, 1.0f);
-    const glm::vec3 f0 = glm::mix(glm::vec3(0.04f), material.color, metallic);
+    // MICROFACET_REFL lobe uses albedo directly with F = 1.
+    const glm::vec3 f0 = material.type == MATERIAL_MICROFACETS ? material.color :
+        glm::mix(glm::vec3(0.04f), material.color, metallic);
     if (glm::length2(outgoing - glm::reflect(incoming, normal)) < 1e-10f)
     {
         return f0;
@@ -614,8 +616,10 @@ __device__ glm::vec3 evaluateDirectBSDF(const Material& material, const glm::vec
     const glm::vec3 wh = glm::normalize(wo + wi);
     const float G = 1.0f / (1.0f + bsdfTrowbridgeReitzLambda(wo, roughness) +
         bsdfTrowbridgeReitzLambda(wi, roughness));
-    const glm::vec3 f0 = glm::mix(glm::vec3(0.04f), material.color,
-        glm::clamp(material.metallic, 0.0f, 1.0f));
+    // MICROFACETS uses albedo with unit Fresnel.
+    const glm::vec3 f0 = material.type == MATERIAL_MICROFACETS ? material.color :
+        glm::mix(glm::vec3(0.04f), material.color,
+            glm::clamp(material.metallic, 0.0f, 1.0f));
     glm::vec3 result = f0 * (trowbridgeReitzDistribution(wh, roughness) * G /
         (4.0f * wo.z * wi.z));
     if (material.type == MATERIAL_COOK_TORRANCE)
@@ -800,11 +804,21 @@ __global__ void shadeBSDF(
                     break;
                 }
                 case MATERIAL_MICROFACETS:
-                    scatterRoughSpecular(pathSegment, intersect, normal, material.roughness, rng);
-                    pathSegment.color *= roughSpecularThroughput(
-                        incoming, pathSegment.ray.direction, normal, material, material.roughness);
-                    pathSegment.previousBsdfPdf = bsdfPdf(material, incoming,
-                        pathSegment.ray.direction, normal);
+                    if (scatterRoughSpecular(pathSegment, intersect, normal, material.roughness, rng))
+                    {
+                        pathSegment.color *= roughSpecularThroughput(
+                            incoming, pathSegment.ray.direction, normal, material, material.roughness);
+                        pathSegment.previousBsdfPdf = bsdfPdf(material, incoming,
+                            pathSegment.ray.direction, normal);
+                    }
+                    else
+                    {
+                        // Sample_f_microfacet_refl returns black when the
+                        // reflected direction leaves wo's hemisphere.
+                        pathSegment.color = glm::vec3(0.0f);
+                        pathSegment.previousBsdfPdf = 0.0f;
+                        pathSegment.remainingBounces = 0;
+                    }
                     pathSegment.previousBounceWasSpecular = false;
                     break;
                 case MATERIAL_DIFFUSE:

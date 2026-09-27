@@ -51,7 +51,7 @@ __device__ void scatterMirror(
     const glm::vec3& intersect,
     glm::vec3 normal);
 
-__device__ void scatterRoughSpecular(
+__device__ bool scatterRoughSpecular(
     PathSegment& pathSegment,
     const glm::vec3& intersect,
     glm::vec3 normal,
