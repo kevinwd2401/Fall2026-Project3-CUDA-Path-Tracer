@@ -36,7 +36,6 @@ If you are using Visual Studio, you can set this in the `Debugging > Command Arg
 ### Controls
 
 * Esc to save an image and exit.
-* S to save an image. Watch the console for the output filename.
 * Space to re-center the camera at the original scene lookAt point.
 * Left mouse button to rotate the camera.
 * Right mouse button on the vertical axis to zoom in/out.

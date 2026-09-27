@@ -407,6 +407,9 @@ int main(int argc, char** argv)
 
 void saveImage()
 {
+    // The renderer keeps its accumulation buffer on the GPU during
+    // interactive rendering.
+    pathtraceCopyImageToHost();
     float samples = iteration;
     // output image file
     Image img(width, height);
@@ -498,9 +501,6 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
             case GLFW_KEY_ESCAPE:
                 saveImage();
                 glfwSetWindowShouldClose(window, GL_TRUE);
-                break;
-            case GLFW_KEY_S:
-                saveImage();
                 break;
             case GLFW_KEY_SPACE:
                 camchanged = true;

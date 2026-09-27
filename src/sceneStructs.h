@@ -110,9 +110,14 @@ struct RenderState
 struct PathSegment
 {
     Ray ray;
+    // color is the path throughput.  Radiance is accumulated separately so a
+    // direct-light sample does not terminate the path that generated it.
     glm::vec3 color;
+    glm::vec3 radiance;
     int pixelIndex;
     int remainingBounces;
+    float previousBsdfPdf;
+    bool previousBounceWasSpecular;
 };
 
 // Use with a corresponding PathSegment to do:
@@ -123,4 +128,5 @@ struct ShadeableIntersection
   float t;
   glm::vec3 surfaceNormal;
   int materialId;
+  int primitiveIndex;
 };
