@@ -569,14 +569,13 @@ __device__ LightSurfaceSample sampleLightSurface(const Geom& geom, thrust::defau
 }
 
 __device__ float lightPdfSolidAngle(const Geom& light, const glm::vec3& referencePoint,
-    const glm::vec3& lightPoint, int lightCount)
+    const glm::vec3& lightPoint, const glm::vec3& lightNormal, int lightCount)
 {
     if (lightCount <= 0) return 0.0f;
     const glm::vec3 toLight = lightPoint - referencePoint;
     const float distance2 = glm::dot(toLight, toLight);
     if (distance2 <= EPSILON) return 0.0f;
-    const float lightCosine = glm::dot(lightSurfaceNormal(light, lightPoint),
-        -glm::normalize(toLight));
+    const float lightCosine = glm::dot(lightNormal, -glm::normalize(toLight));
     const float areaPdf = primitiveSurfaceAreaPdf(light, lightPoint);
     return lightCosine > EPSILON ? distance2 * areaPdf /
         (lightCosine * static_cast<float>(lightCount)) : 0.0f;
@@ -844,15 +843,17 @@ __global__ void shadeBSDF(
             }
             if (material.type == MATERIAL_EMISSIVE || fmaxf(emission.x, fmaxf(emission.y, emission.z)) > 0.0f) {
                 const glm::vec3 lightPoint = pathSegment.ray.origin + intersection.t * pathSegment.ray.direction;
-                const bool frontFacing = glm::dot(lightSurfaceNormal(geoms[intersection.primitiveIndex], lightPoint),
+                const Geom& hitLight = geoms[intersection.primitiveIndex];
+                const glm::vec3 hitLightNormal = lightSurfaceNormal(hitLight, lightPoint);
+                const bool frontFacing = glm::dot(hitLightNormal,
                     -glm::normalize(pathSegment.ray.direction)) > EPSILON;
                 if (frontFacing)
                 {
                     float misWeight = 1.0f;
                     if (!pathSegment.previousBounceWasSpecular && pathSegment.previousBsdfPdf > 0.0f)
                     {
-                        const float lightPdf = lightPdfSolidAngle(geoms[intersection.primitiveIndex],
-                            pathSegment.ray.origin, lightPoint, lightCount);
+                        const float lightPdf = lightPdfSolidAngle(hitLight, pathSegment.ray.origin,
+                            lightPoint, hitLightNormal, lightCount);
                         const float bsdfPdf2 = pathSegment.previousBsdfPdf * pathSegment.previousBsdfPdf;
                         misWeight = bsdfPdf2 / (bsdfPdf2 + lightPdf * lightPdf);
                     }

@@ -366,6 +366,13 @@ int main(int argc, char** argv)
 
     // Load scene file
     scene = new Scene(sceneFile, environmentFile ? environmentFile : "");
+    if (scene->emissivePrimitives.empty() && !scene->environment.valid())
+    {
+        std::cerr << "Error: scene has no light sources. Add an emissive primitive or pass an HDRI "
+                  << "environment map as the second argument." << std::endl;
+        delete scene;
+        return EXIT_FAILURE;
+    }
 
     //Create Instance for ImGUIData
     guiData = new GuiDataContainer();
