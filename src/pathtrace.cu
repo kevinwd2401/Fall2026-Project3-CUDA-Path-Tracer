@@ -19,11 +19,11 @@
 #include "interactions.h"
 #include "tonemapping.h"
 
-#define MATERIAL_SORT 1
+#define MATERIAL_SORT 0
 #define RUSSIAN_ROULETTE 1
 #define RUSSIAN_ROULETTE_START_DEPTH 3
 #define DEPTH_OF_FIELD 1
-#define ERRORCHECK 1
+#define ERRORCHECK 0
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -880,13 +880,14 @@ __device__ float srgbToLinear(float value)
     return value <= 0.04045f ? value / 12.92f : powf((value + 0.055f) / 1.055f, 2.4f);
 }
 
-__device__ glm::vec3 sampleBaseColorTexture(const Material& material, const glm::vec2& uv,
+__device__ glm::vec4 sampleBaseColorTexture(const Material& material, const glm::vec2& uv,
     const DeviceTextureStore& textureStore)
 {
-    if (!textureStore.validTextureIndex(material.baseColorTexture)) return glm::vec3(1.0f);
+    if (!textureStore.validTextureIndex(material.baseColorTexture)) return glm::vec4(1.0f);
     const TextureInfo& texture = textureStore.textures[material.baseColorTexture];
-    const glm::vec3 srgb = glm::vec3(sampleTexture(texture, uv, textureStore));
-    return glm::vec3(srgbToLinear(srgb.x), srgbToLinear(srgb.y), srgbToLinear(srgb.z));
+    const glm::vec4 sampled = sampleTexture(texture, uv, textureStore);
+    return glm::vec4(srgbToLinear(sampled.r), srgbToLinear(sampled.g),
+        srgbToLinear(sampled.b), sampled.a);
 }
 
 __device__ glm::vec3 sampleNormalTexture(const Material& material, const Triangle& triangle,
@@ -1064,6 +1065,7 @@ __device__ void enqueueDirectLighting(const Material& material, const PathSegmen
 __global__ void shadeBSDF(
     int iter,
     int depth,
+    int traceDepth,
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
@@ -1088,10 +1090,41 @@ __global__ void shadeBSDF(
             Material material = materials[intersection.materialId];
             PathSegment pathSegment = pathSegments[idx];
             const PrimitiveRef& hitPrimitive = primitiveStore.primitives[intersection.primitiveIndex];
+
+
+            // Sample texture for color and alpha
+            glm::vec4 baseColorSample(1.0f);
             if (hitPrimitive.type == TRIANGLE &&
                 primitiveStore.triangles[hitPrimitive.index].hasTextureCoordinates)
             {
-                material.color *= sampleBaseColorTexture(material, intersection.surfaceUV, textureStore);
+                baseColorSample = sampleBaseColorTexture(material, intersection.surfaceUV, textureStore);
+                material.color *= glm::vec3(baseColorSample);
+            }
+
+            const float opacity = glm::clamp(material.alpha * baseColorSample.a, 0.0f, 1.0f);
+            bool ignoreIntersection = false;
+            if (material.alphaMode == ALPHA_MASK)
+            {
+                ignoreIntersection = opacity < material.alphaCutoff;
+            }
+            else if (material.alphaMode == ALPHA_BLEND)
+            {
+                // Stochastically selecting the surface or the ray behind it
+                // gives the expected alpha blend without splitting the path.
+                thrust::default_random_engine alphaRng = makeSeededRandomEngine(
+                    iter, pathSegment.pixelIndex, depth);
+                thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
+                ignoreIntersection = u01(alphaRng) >= opacity;
+            }
+
+            if (ignoreIntersection)
+            {
+                // Alpha transparency: ignore the hit, keep the throughput, BSDF history
+                const glm::vec3 intersectionPoint = pathSegment.ray.origin +
+                    intersection.t * pathSegment.ray.direction;
+                pathSegment.ray.origin = intersectionPoint + 0.001f * pathSegment.ray.direction;
+                pathSegments[idx] = pathSegment;
+                return;
             }
             glm::vec3 emission = material.emission;
             if (fmaxf(emission.x, fmaxf(emission.y, emission.z)) <= 0.0f && material.emittance > 0.0f)
@@ -1227,7 +1260,8 @@ __global__ void shadeBSDF(
                 --pathSegment.remainingBounces;
 
 #if RUSSIAN_ROULETTE
-                if (depth >= RUSSIAN_ROULETTE_START_DEPTH && pathSegment.remainingBounces > 0)
+                const int completedBounces = traceDepth - pathSegment.remainingBounces;
+                if (completedBounces >= RUSSIAN_ROULETTE_START_DEPTH && pathSegment.remainingBounces > 0)
                 {
                     const float survivalProbability = glm::clamp(
                         fmaxf(pathSegment.color.x, fmaxf(pathSegment.color.y, pathSegment.color.z)),
@@ -1249,6 +1283,7 @@ __global__ void shadeBSDF(
             pathSegments[idx] = pathSegment;
         }
         else {
+			// Ray hit nothing, so sample the environment map if present
             PathSegment pathSegment = pathSegments[idx];
             if (environment.valid())
             {
@@ -1454,6 +1489,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         shadeBSDF<<<numblocksPathSegmentTracing, blockSize1d>>>(
             iter,
             depth,
+            traceDepth,
             num_paths,
             dev_intersections,
             dev_paths,
@@ -1513,7 +1549,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             IsTerminated());
         num_paths = dev_path_end - dev_paths;
 
-		iterationComplete = (depth >= traceDepth) || (num_paths == 0);
+		// iteration can be greater than traceDepth if some paths are still active due to alpha blending
+		iterationComplete = num_paths == 0;
 
         if (guiData != NULL)
         {

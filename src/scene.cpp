@@ -136,6 +136,7 @@ Material makeDefaultMaterial()
 {
     Material material{};
     material.color = glm::vec3(1.0f);
+    material.alpha = 1.0f;
     material.emission = glm::vec3(0.0f);
     material.type = MATERIAL_DIFFUSE;
     material.indexOfRefraction = 1.55f;
@@ -143,6 +144,8 @@ Material makeDefaultMaterial()
     material.baseColorTexture = -1;
     material.normalTexture = -1;
     material.normalScale = 1.0f;
+    material.alphaMode = ALPHA_OPAQUE;
+    material.alphaCutoff = 0.5f;
     return material;
 }
 
@@ -909,7 +912,16 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         {
             Material material = makeDefaultMaterial(); material.type = MATERIAL_COOK_TORRANCE;
             const json pbr = definition.value("pbrMetallicRoughness", json::object());
-            if (pbr.contains("baseColorFactor")) { const auto& f = pbr.at("baseColorFactor"); material.color = glm::vec3(f.at(0).get<float>(), f.at(1).get<float>(), f.at(2).get<float>()); }
+            if (pbr.contains("baseColorFactor"))
+            {
+                const auto& f = pbr.at("baseColorFactor");
+                material.color = glm::vec3(f.at(0).get<float>(), f.at(1).get<float>(), f.at(2).get<float>());
+                material.alpha = glm::clamp(f.at(3).get<float>(), 0.0f, 1.0f);
+            }
+            const string alphaMode = definition.value("alphaMode", "OPAQUE");
+            if (alphaMode == "MASK") material.alphaMode = ALPHA_MASK;
+            else if (alphaMode == "BLEND") material.alphaMode = ALPHA_BLEND;
+            material.alphaCutoff = glm::clamp(definition.value("alphaCutoff", 0.5f), 0.0f, 1.0f);
             material.metallic = glm::clamp(pbr.value("metallicFactor", 1.0f), 0.0f, 1.0f);
             material.roughness = glm::clamp(pbr.value("roughnessFactor", 1.0f), 0.001f, 1.0f);
             material.indexOfRefraction = definition.value("ior", 1.5f);
@@ -1044,7 +1056,7 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         for (int root : roots) visitNode(root, glm::mat4(1.0f));
         if (primitives.empty()) throw runtime_error("scene contains no supported triangle geometry");
 
-        Camera& camera = state.camera; camera.resolution = glm::ivec2(800, 800); state.iterations = 6000; state.traceDepth = 8; state.imageName = inputPath.stem().string();
+        Camera& camera = state.camera; camera.resolution = glm::ivec2(1200, 800); state.iterations = 6000; state.traceDepth = 8; state.imageName = inputPath.stem().string();
         float yscaled = tan(45.0f * PI / 180.0f);
         const json cameras = document.value("cameras", json::array());
         if (cameraIndex >= 0 && cameraIndex < static_cast<int>(cameras.size()) && cameras.at(cameraIndex).value("type", "") == "perspective")

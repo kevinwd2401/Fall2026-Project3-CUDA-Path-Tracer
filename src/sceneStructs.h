@@ -27,6 +27,13 @@ enum MaterialType
     MATERIAL_TYPE_COUNT
 };
 
+enum AlphaMode
+{
+    ALPHA_OPAQUE = 0,
+    ALPHA_MASK,
+    ALPHA_BLEND
+};
+
 struct Ray
 {
     glm::vec3 origin;
@@ -88,6 +95,7 @@ struct BVHNode
 struct Material
 {
     glm::vec3 color;
+    float alpha;
     glm::vec3 emission;
     MaterialType type;
     struct
@@ -104,6 +112,8 @@ struct Material
     int baseColorTexture;
     int normalTexture;
     float normalScale;
+    AlphaMode alphaMode;
+    float alphaCutoff;
 };
 
 // Texture texels are packed into Scene::textureTexels.  texelOffset points
