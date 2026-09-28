@@ -19,6 +19,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -106,6 +107,9 @@ Material makeDefaultMaterial()
     material.type = MATERIAL_DIFFUSE;
     material.indexOfRefraction = 1.55f;
     material.roughness = 1.0f;
+    material.baseColorTexture = -1;
+    material.normalTexture = -1;
+    material.normalScale = 1.0f;
     return material;
 }
 
@@ -228,6 +232,20 @@ vector<glm::vec3> readVec3(const json& document, const vector<vector<unsigned ch
         float f[3];
         memcpy(f, view.buffer->data() + view.offset + i * view.stride, sizeof(f));
         values[i] = glm::vec3(f[0], f[1], f[2]);
+    }
+    return values;
+}
+
+vector<glm::vec2> readVec2(const json& document, const vector<vector<unsigned char>>& buffers, int accessorIndex)
+{
+    const AccessorView view = getAccessor(document, buffers, accessorIndex);
+    if (view.componentType != 5126 || view.components != 2) throw runtime_error("TEXCOORD_0 must be FLOAT VEC2");
+    vector<glm::vec2> values(view.count);
+    for (size_t i = 0; i < view.count; ++i)
+    {
+        float f[2];
+        memcpy(f, view.buffer->data() + view.offset + i * view.stride, sizeof(f));
+        values[i] = glm::vec2(f[0], f[1]);
     }
     return values;
 }
@@ -683,6 +701,126 @@ void Scene::loadFromGLTF(const std::string& gltfName)
             buffers.push_back(move(buffer));
         }
 
+        // Decode glTF texture sources before materials reference them.  Both
+        // external/data-URI images and GLB buffer-view images are supported.
+        const json imageDefinitions = document.value("images", json::array());
+        const json textureDefinitions = document.value("textures", json::array());
+        const json samplerDefinitions = document.value("samplers", json::array());
+        vector<int> gltfTextureToSceneTexture(textureDefinitions.size(), -1);
+        for (size_t textureIndex = 0; textureIndex < textureDefinitions.size(); ++textureIndex)
+        {
+            const json& textureDefinition = textureDefinitions.at(textureIndex);
+            if (!textureDefinition.contains("source"))
+            {
+                cerr << "Warning: glTF texture " << textureIndex << " has no supported image source" << endl;
+                continue;
+            }
+            const int imageIndex = textureDefinition.at("source").get<int>();
+            if (imageIndex < 0 || imageIndex >= static_cast<int>(imageDefinitions.size()))
+                throw runtime_error("texture image index out of range");
+            const json& imageDefinition = imageDefinitions.at(imageIndex);
+            vector<unsigned char> ownedImageBytes;
+            const unsigned char* imageBytes = nullptr;
+            size_t imageByteCount = 0;
+            if (imageDefinition.contains("uri"))
+            {
+                const string uri = imageDefinition.at("uri").get<string>();
+                if (uri.rfind("data:", 0) == 0)
+                {
+                    const size_t comma = uri.find(',');
+                    if (comma == string::npos || uri.find(";base64") == string::npos)
+                        throw runtime_error("only base64 image data URIs are supported");
+                    ownedImageBytes = decodeBase64(uri.substr(comma + 1));
+                }
+                else
+                {
+                    ownedImageBytes = readBinaryFile(inputPath.parent_path() / filesystem::path(uri));
+                }
+                imageBytes = ownedImageBytes.data();
+                imageByteCount = ownedImageBytes.size();
+            }
+            else if (imageDefinition.contains("bufferView"))
+            {
+                const int viewIndex = imageDefinition.at("bufferView").get<int>();
+                const json& views = document.value("bufferViews", json::array());
+                if (viewIndex < 0 || viewIndex >= static_cast<int>(views.size()))
+                    throw runtime_error("image bufferView index out of range");
+                const json& view = views.at(viewIndex);
+                const int bufferIndex = view.at("buffer").get<int>();
+                if (bufferIndex < 0 || bufferIndex >= static_cast<int>(buffers.size()))
+                    throw runtime_error("image bufferView buffer index out of range");
+                const size_t offset = view.value("byteOffset", size_t(0));
+                imageByteCount = view.at("byteLength").get<size_t>();
+                if (offset > buffers[bufferIndex].size() || imageByteCount > buffers[bufferIndex].size() - offset)
+                    throw runtime_error("image bufferView exceeds its buffer");
+                imageBytes = buffers[bufferIndex].data() + offset;
+            }
+            else
+            {
+                cerr << "Warning: glTF image " << imageIndex << " has no URI or bufferView" << endl;
+                continue;
+            }
+            if (imageByteCount == 0 || imageByteCount > static_cast<size_t>(numeric_limits<int>::max()))
+                throw runtime_error("image is empty or too large to decode");
+
+            int width = 0, height = 0, channels = 0;
+            unsigned char* decoded = stbi_load_from_memory(imageBytes, static_cast<int>(imageByteCount),
+                &width, &height, &channels, 4);
+            if (decoded == nullptr || width <= 0 || height <= 0)
+            {
+                cerr << "Warning: could not decode glTF texture " << textureIndex << ": "
+                     << (stbi_failure_reason() ? stbi_failure_reason() : "unknown image error") << endl;
+                if (decoded) stbi_image_free(decoded);
+                continue;
+            }
+
+            TextureInfo texture{};
+            texture.width = width;
+            texture.height = height;
+            texture.texelOffset = static_cast<int>(textureTexels.size());
+            // glTF defaults: REPEAT wrapping and implementation-defined
+            // filtering.  Store explicit sampler values when they are present.
+            texture.wrapS = 10497;
+            texture.wrapT = 10497;
+            texture.minFilter = -1;
+            texture.magFilter = -1;
+            if (textureDefinition.contains("sampler"))
+            {
+                const int samplerIndex = textureDefinition.at("sampler").get<int>();
+                if (samplerIndex < 0 || samplerIndex >= static_cast<int>(samplerDefinitions.size()))
+                    throw runtime_error("texture sampler index out of range");
+                const json& sampler = samplerDefinitions.at(samplerIndex);
+                texture.wrapS = sampler.value("wrapS", texture.wrapS);
+                texture.wrapT = sampler.value("wrapT", texture.wrapT);
+                texture.minFilter = sampler.value("minFilter", texture.minFilter);
+                texture.magFilter = sampler.value("magFilter", texture.magFilter);
+            }
+            const size_t texelCount = static_cast<size_t>(width) * height;
+            textureTexels.reserve(textureTexels.size() + texelCount);
+            for (size_t texel = 0; texel < texelCount; ++texel)
+            {
+                const unsigned char* rgba = decoded + texel * 4;
+                textureTexels.push_back(glm::vec4(rgba[0], rgba[1], rgba[2], rgba[3]) / 255.0f);
+            }
+            stbi_image_free(decoded);
+            gltfTextureToSceneTexture[textureIndex] = static_cast<int>(textures.size());
+            textures.push_back(texture);
+        }
+
+        const auto resolveTexture = [&](const json& textureInfo, const char* usage) -> int {
+            const int textureIndex = textureInfo.value("index", -1);
+            if (textureIndex < 0 || textureIndex >= static_cast<int>(gltfTextureToSceneTexture.size()))
+                throw runtime_error(string(usage) + " texture index out of range");
+            if (textureInfo.value("texCoord", 0) != 0)
+            {
+                cerr << "Warning: " << usage << " uses TEXCOORD_1+, which is not supported" << endl;
+                return -1;
+            }
+            if (textureInfo.contains("extensions") && textureInfo.at("extensions").contains("KHR_texture_transform"))
+                cerr << "Warning: " << usage << " KHR_texture_transform is not yet supported" << endl;
+            return gltfTextureToSceneTexture[textureIndex];
+        };
+
         vector<int> materialIDs;
         for (const json& definition : document.value("materials", json::array()))
         {
@@ -735,7 +873,14 @@ void Scene::loadFromGLTF(const std::string& gltfName)
                 cout << "Imported dielectric material '" << definition.value("name", "<unnamed>")
                      << "' with IOR " << material.indexOfRefraction << endl;
             }
-            if (pbr.contains("baseColorTexture")) cerr << "Warning: glTF baseColorTexture is ignored for material " << materialIDs.size() << endl;
+            if (pbr.contains("baseColorTexture"))
+                material.baseColorTexture = resolveTexture(pbr.at("baseColorTexture"), "baseColorTexture");
+            if (definition.contains("normalTexture"))
+            {
+                const json& normalTexture = definition.at("normalTexture");
+                material.normalTexture = resolveTexture(normalTexture, "normalTexture");
+                material.normalScale = normalTexture.value("scale", 1.0f);
+            }
             materialIDs.push_back(static_cast<int>(materials.size())); materials.push_back(material);
         }
         const int defaultMaterialID = static_cast<int>(materials.size());
@@ -758,21 +903,32 @@ void Scene::loadFromGLTF(const std::string& gltfName)
                     const bool hasNormals = attributes.contains("NORMAL");
                     const vector<glm::vec3> normals = hasNormals ? readVec3(document, buffers, attributes.at("NORMAL").get<int>()) : vector<glm::vec3>();
                     if (hasNormals && normals.size() != positions.size()) throw runtime_error("NORMAL and POSITION counts differ");
+                    const bool hasTextureCoordinates = attributes.contains("TEXCOORD_0");
+                    const vector<glm::vec2> textureCoordinates = hasTextureCoordinates ?
+                        readVec2(document, buffers, attributes.at("TEXCOORD_0").get<int>()) : vector<glm::vec2>();
+                    if (hasTextureCoordinates && textureCoordinates.size() != positions.size())
+                        throw runtime_error("TEXCOORD_0 and POSITION counts differ");
                     vector<uint32_t> indices = primitive.contains("indices") ? readIndices(document, buffers, primitive.at("indices").get<int>()) : vector<uint32_t>();
                     if (!primitive.contains("indices")) { indices.resize(positions.size()); for (size_t i = 0; i < indices.size(); ++i) indices[i] = static_cast<uint32_t>(i); }
                     if (indices.size() % 3) throw runtime_error("triangle index count is not divisible by three");
                     int materialID = defaultMaterialID;
                     if (primitive.contains("material")) { const int sourceID = primitive.at("material").get<int>(); if (sourceID < 0 || sourceID >= static_cast<int>(materialIDs.size())) throw runtime_error("material index out of range"); materialID = materialIDs[sourceID]; }
+                    const Material& primitiveMaterial = materials[materialID];
+                    if (!hasTextureCoordinates && (primitiveMaterial.baseColorTexture >= 0 || primitiveMaterial.normalTexture >= 0))
+                        cerr << "Warning: textured glTF primitive has no TEXCOORD_0; its texture maps will be skipped" << endl;
                     const glm::mat3 normalMatrix = hasNormals ? glm::transpose(glm::inverse(glm::mat3(world))) : glm::mat3(1.0f);
                     for (size_t i = 0; i < indices.size(); i += 3)
                     {
                         Geom triangle{}; triangle.type = TRIANGLE; triangle.materialid = materialID;
-                        triangle.transform = triangle.inverseTransform = triangle.invTranspose = glm::mat4(1.0f); triangle.hasVertexNormals = hasNormals ? 1 : 0;
+                        triangle.transform = triangle.inverseTransform = triangle.invTranspose = glm::mat4(1.0f);
+                        triangle.hasVertexNormals = hasNormals ? 1 : 0;
+                        triangle.hasTextureCoordinates = hasTextureCoordinates ? 1 : 0;
                         for (int vertex = 0; vertex < 3; ++vertex)
                         {
                             const uint32_t positionIndex = indices[i + vertex]; if (positionIndex >= positions.size()) throw runtime_error("triangle index out of range");
                             triangle.triangleVertices[vertex] = glm::vec3(world * glm::vec4(positions[positionIndex], 1.0f));
                             if (hasNormals) triangle.triangleNormals[vertex] = glm::normalize(normalMatrix * normals[positionIndex]);
+                            if (hasTextureCoordinates) triangle.triangleUVs[vertex] = textureCoordinates[positionIndex];
                             if (!hasBounds) { boundsMin = boundsMax = triangle.triangleVertices[vertex]; hasBounds = true; }
                             else { boundsMin = glm::min(boundsMin, triangle.triangleVertices[vertex]); boundsMax = glm::max(boundsMax, triangle.triangleVertices[vertex]); }
                         }

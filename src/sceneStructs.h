@@ -49,7 +49,9 @@ struct Geom
     // upload and nearest-hit loop serve analytic and mesh primitives alike.
     glm::vec3 triangleVertices[3];
     glm::vec3 triangleNormals[3];
+    glm::vec2 triangleUVs[3];
     int hasVertexNormals;
+    int hasTextureCoordinates;
 };
 
 // A flat, depth-first BVH node shared verbatim by the CPU builder and CUDA
@@ -84,6 +86,22 @@ struct Material
     float emittance;
     float metallic;
     float roughness;
+    int baseColorTexture;
+    int normalTexture;
+    float normalScale;
+};
+
+// Texture texels are packed into Scene::textureTexels.  texelOffset points
+// into that flat array so this POD descriptor can be copied directly to CUDA.
+struct TextureInfo
+{
+    int width;
+    int height;
+    int texelOffset;
+    int wrapS;
+    int wrapT;
+    int minFilter;
+    int magFilter;
 };
 
 struct Camera
@@ -127,6 +145,7 @@ struct ShadeableIntersection
 {
   float t;
   glm::vec3 surfaceNormal;
+  glm::vec2 surfaceUV;
   int materialId;
   int primitiveIndex;
 };

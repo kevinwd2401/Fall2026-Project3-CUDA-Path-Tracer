@@ -113,6 +113,7 @@ __host__ __device__ float triangleIntersectionTest(
     Ray r,
     glm::vec3& intersectionPoint,
     glm::vec3& normal,
+    glm::vec2& uv,
     bool& outside)
 {
     // Moller-Trumbore in world space. glTF instances have already had their
@@ -158,6 +159,9 @@ __host__ __device__ float triangleIntersectionTest(
     }
 
     intersectionPoint = r.origin + t * r.direction;
+    uv = triangle.hasTextureCoordinates ?
+        (1.0f - u - v) * triangle.triangleUVs[0] + u * triangle.triangleUVs[1] + v * triangle.triangleUVs[2] :
+        glm::vec2(0.0f);
     if (triangle.hasVertexNormals)
     {
         const float w = 1.0f - u - v;

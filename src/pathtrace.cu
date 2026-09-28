@@ -94,6 +94,9 @@ static int dev_lightPrimitiveCount = 0;
 static glm::vec3* dev_environmentTexels = NULL;
 static float* dev_environmentCdf = NULL;
 static float* dev_environmentPdfSolidAngle = NULL;
+static TextureInfo* dev_textures = NULL;
+static glm::vec4* dev_textureTexels = NULL;
+static int dev_textureCount = 0;
 
 struct DeviceEnvironmentMap
 {
@@ -110,6 +113,20 @@ struct DeviceEnvironmentMap
 };
 
 static DeviceEnvironmentMap dev_environment;
+
+struct DeviceTextureStore
+{
+    const TextureInfo* textures = NULL;
+    const glm::vec4* texels = NULL;
+    int textureCount = 0;
+
+    __host__ __device__ bool validTextureIndex(int textureIndex) const
+    {
+        return textures != NULL && texels != NULL && textureIndex >= 0 && textureIndex < textureCount;
+    }
+};
+
+static DeviceTextureStore dev_textureStore;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 static int* dev_materialSortKeys = NULL;
@@ -172,6 +189,17 @@ void pathtraceInit(Scene* scene)
             scene->environment.width, scene->environment.height };
     }
 
+    dev_textureCount = static_cast<int>(scene->textures.size());
+    if (dev_textureCount > 0 && !scene->textureTexels.empty())
+    {
+        cudaMalloc(&dev_textures, dev_textureCount * sizeof(TextureInfo));
+        cudaMalloc(&dev_textureTexels, scene->textureTexels.size() * sizeof(glm::vec4));
+        cudaMemcpy(dev_textures, scene->textures.data(), dev_textureCount * sizeof(TextureInfo), cudaMemcpyHostToDevice);
+        cudaMemcpy(dev_textureTexels, scene->textureTexels.data(),
+            scene->textureTexels.size() * sizeof(glm::vec4), cudaMemcpyHostToDevice);
+        dev_textureStore = { dev_textures, dev_textureTexels, dev_textureCount };
+    }
+
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
@@ -192,12 +220,18 @@ void pathtraceFree()
     cudaFree(dev_environmentTexels);
     cudaFree(dev_environmentCdf);
     cudaFree(dev_environmentPdfSolidAngle);
+    cudaFree(dev_textures);
+    cudaFree(dev_textureTexels);
     cudaFree(dev_intersections);
     cudaFree(dev_materialSortKeys);
     dev_environmentTexels = NULL;
     dev_environmentCdf = NULL;
     dev_environmentPdfSolidAngle = NULL;
     dev_environment = DeviceEnvironmentMap{};
+    dev_textures = NULL;
+    dev_textureTexels = NULL;
+    dev_textureCount = 0;
+    dev_textureStore = DeviceTextureStore{};
 
     checkCUDAError("pathtraceFree");
 }
@@ -288,6 +322,7 @@ __global__ void computeIntersections(
 
         glm::vec3 tmp_intersect;
         glm::vec3 tmp_normal;
+        glm::vec2 hit_uv(0.0f);
 
 
         //bvh traversal
@@ -316,6 +351,7 @@ __global__ void computeIntersections(
                 const Geom& geom = geoms[geomIndex];
                 bool outside = true;
                 float t = -1.0f;
+                glm::vec2 candidateUV(0.0f);
 
                 if (geom.type == CUBE)
                 {
@@ -327,7 +363,7 @@ __global__ void computeIntersections(
                 }
                 else if (geom.type == TRIANGLE)
                 {
-                    t = triangleIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                    t = triangleIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, candidateUV, outside);
                 }
 
                 if (t > 0.0f && t_min > t)
@@ -335,6 +371,7 @@ __global__ void computeIntersections(
                     t_min = t;
                     hit_geom_index = geomIndex;
                     normal = tmp_normal;
+                    hit_uv = candidateUV;
                 }
             }
             nodeIndex = node.escapeIndex;
@@ -351,6 +388,7 @@ __global__ void computeIntersections(
             intersections[path_index].t = t_min;
             intersections[path_index].materialId = geoms[hit_geom_index].materialid;
             intersections[path_index].surfaceNormal = normal;
+            intersections[path_index].surfaceUV = hit_uv;
             intersections[path_index].primitiveIndex = hit_geom_index;
         }
     }
@@ -670,15 +708,129 @@ __device__ bool isOccluded(const Ray& ray, float maxDistance, const Geom* geoms,
         {
             const Geom& geom = geoms[bvhPrimitiveIndices[node.firstPrimitive + offset]];
             glm::vec3 ignoredPoint, ignoredNormal;
+            glm::vec2 ignoredUV;
             bool outside;
             float t = geom.type == CUBE ? boxIntersectionTest(geom, ray, ignoredPoint, ignoredNormal, outside) :
                 (geom.type == SPHERE ? sphereIntersectionTest(geom, ray, ignoredPoint, ignoredNormal, outside) :
-                triangleIntersectionTest(geom, ray, ignoredPoint, ignoredNormal, outside));
+                triangleIntersectionTest(geom, ray, ignoredPoint, ignoredNormal, ignoredUV, outside));
             if (t > 1e-4f && t < maxDistance) return true;
         }
         nodeIndex = node.escapeIndex;
     }
     return false;
+}
+
+__device__ float wrapTextureCoordinate(float coordinate, int wrapMode)
+{
+    // glTF sampler constants: REPEAT = 10497, CLAMP_TO_EDGE = 33071,
+    // MIRRORED_REPEAT = 33648.  Unknown modes fall back to REPEAT.
+    if (wrapMode == 33071) return glm::clamp(coordinate, 0.0f, 1.0f);
+    const float cell = floorf(coordinate);
+    const float fraction = coordinate - cell;
+    if (wrapMode == 33648)
+    {
+        const int cellIndex = static_cast<int>(cell);
+        return (cellIndex % 2 == 0) ? fraction : 1.0f - fraction;
+    }
+    return fraction;
+}
+
+__device__ int wrapTextureTexel(int texel, int size, int wrapMode)
+{
+    if (wrapMode == 33071) return max(0, min(texel, size - 1));
+    if (wrapMode == 33648)
+    {
+        const int period = 2 * size;
+        int mirrored = texel % period;
+        if (mirrored < 0) mirrored += period;
+        return mirrored < size ? mirrored : period - 1 - mirrored;
+    }
+    int repeated = texel % size;
+    return repeated < 0 ? repeated + size : repeated;
+}
+
+__device__ bool textureUsesLinearFilter(const TextureInfo& texture)
+{
+    const int filter = texture.magFilter >= 0 ? texture.magFilter : texture.minFilter;
+    return filter == 9729 || filter == 9985 || filter == 9987; // LINEAR variants
+}
+
+__device__ glm::vec4 sampleTexture(const TextureInfo& texture, const glm::vec2& uv,
+    const DeviceTextureStore& textureStore)
+{
+    const float u = wrapTextureCoordinate(uv.x, texture.wrapS);
+    const float v = wrapTextureCoordinate(uv.y, texture.wrapT);
+    const auto texelAt = [&](int x, int y) {
+        x = wrapTextureTexel(x, texture.width, texture.wrapS);
+        y = wrapTextureTexel(y, texture.height, texture.wrapT);
+        return textureStore.texels[texture.texelOffset + y * texture.width + x];
+    };
+
+    // glTF UV (0, 0) corresponds to the first decoded image row, so V is not
+    // flipped here.  This also makes the same sampler work for color and normal maps.
+    if (!textureUsesLinearFilter(texture))
+    {
+        return texelAt(static_cast<int>(floorf(u * texture.width)),
+            static_cast<int>(floorf(v * texture.height)));
+    }
+
+    const float x = u * texture.width - 0.5f;
+    const float y = v * texture.height - 0.5f;
+    const int x0 = static_cast<int>(floorf(x));
+    const int y0 = static_cast<int>(floorf(y));
+    const float tx = x - x0;
+    const float ty = y - y0;
+    const glm::vec4 lower = glm::mix(texelAt(x0, y0), texelAt(x0 + 1, y0), tx);
+    const glm::vec4 upper = glm::mix(texelAt(x0, y0 + 1), texelAt(x0 + 1, y0 + 1), tx);
+    return glm::mix(lower, upper, ty);
+}
+
+__device__ float srgbToLinear(float value)
+{
+    return value <= 0.04045f ? value / 12.92f : powf((value + 0.055f) / 1.055f, 2.4f);
+}
+
+__device__ glm::vec3 sampleBaseColorTexture(const Material& material, const glm::vec2& uv,
+    const DeviceTextureStore& textureStore)
+{
+    if (!textureStore.validTextureIndex(material.baseColorTexture)) return glm::vec3(1.0f);
+    const TextureInfo& texture = textureStore.textures[material.baseColorTexture];
+    const glm::vec3 srgb = glm::vec3(sampleTexture(texture, uv, textureStore));
+    return glm::vec3(srgbToLinear(srgb.x), srgbToLinear(srgb.y), srgbToLinear(srgb.z));
+}
+
+__device__ glm::vec3 sampleNormalTexture(const Material& material, const Geom& triangle,
+    const glm::vec2& uv, glm::vec3 geometricNormal, const DeviceTextureStore& textureStore)
+{
+    if (!textureStore.validTextureIndex(material.normalTexture) || !triangle.hasTextureCoordinates)
+        return geometricNormal;
+
+    const TextureInfo& texture = textureStore.textures[material.normalTexture];
+    const glm::vec3 encodedNormal = glm::vec3(sampleTexture(texture, uv, textureStore));
+    glm::vec3 tangentSpaceNormal = 2.0f * encodedNormal - glm::vec3(1.0f);
+    tangentSpaceNormal.x *= material.normalScale;
+    tangentSpaceNormal.y *= material.normalScale;
+    if (glm::length2(tangentSpaceNormal) <= EPSILON) return geometricNormal;
+    tangentSpaceNormal = glm::normalize(tangentSpaceNormal);
+
+    const glm::vec3 edge1 = triangle.triangleVertices[1] - triangle.triangleVertices[0];
+    const glm::vec3 edge2 = triangle.triangleVertices[2] - triangle.triangleVertices[0];
+    const glm::vec2 uv1 = triangle.triangleUVs[1] - triangle.triangleUVs[0];
+    const glm::vec2 uv2 = triangle.triangleUVs[2] - triangle.triangleUVs[0];
+    const float determinant = uv1.x * uv2.y - uv1.y * uv2.x;
+    if (fabsf(determinant) <= EPSILON) return geometricNormal;
+
+    const glm::vec3 normal = glm::normalize(geometricNormal);
+    glm::vec3 tangent = (uv2.y * edge1 - uv1.y * edge2) / determinant;
+    tangent -= normal * glm::dot(normal, tangent);
+    if (glm::length2(tangent) <= EPSILON) return geometricNormal;
+    tangent = glm::normalize(tangent);
+
+    const glm::vec3 uvBitangent = (uv1.x * edge2 - uv2.x * edge1) / determinant;
+    glm::vec3 bitangent = glm::cross(normal, tangent);
+    if (glm::dot(bitangent, uvBitangent) < 0.0f) bitangent = -bitangent;
+    return glm::normalize(tangentSpaceNormal.x * tangent + tangentSpaceNormal.y * bitangent +
+        tangentSpaceNormal.z * normal);
 }
 
 __device__ float trowbridgeReitzDistribution(const glm::vec3& wh, float roughness)
@@ -823,6 +975,7 @@ __global__ void shadeBSDF(
     const int* lightPrimitives,
     int emissiveLightCount,
     DeviceEnvironmentMap environment,
+    DeviceTextureStore textureStore,
     int lightCount,
     const BVHNode* bvhNodes,
     int bvhNodeCount,
@@ -836,6 +989,11 @@ __global__ void shadeBSDF(
         {
             Material material = materials[intersection.materialId];
             PathSegment pathSegment = pathSegments[idx];
+            const Geom& hitGeom = geoms[intersection.primitiveIndex];
+            if (hitGeom.type == TRIANGLE && hitGeom.hasTextureCoordinates)
+            {
+                material.color *= sampleBaseColorTexture(material, intersection.surfaceUV, textureStore);
+            }
             glm::vec3 emission = material.emission;
             if (fmaxf(emission.x, fmaxf(emission.y, emission.z)) <= 0.0f && material.emittance > 0.0f)
             {
@@ -843,7 +1001,7 @@ __global__ void shadeBSDF(
             }
             if (material.type == MATERIAL_EMISSIVE || fmaxf(emission.x, fmaxf(emission.y, emission.z)) > 0.0f) {
                 const glm::vec3 lightPoint = pathSegment.ray.origin + intersection.t * pathSegment.ray.direction;
-                const Geom& hitLight = geoms[intersection.primitiveIndex];
+                const Geom& hitLight = hitGeom;
                 const glm::vec3 hitLightNormal = lightSurfaceNormal(hitLight, lightPoint);
                 const bool frontFacing = glm::dot(hitLightNormal,
                     -glm::normalize(pathSegment.ray.direction)) > EPSILON;
@@ -864,6 +1022,11 @@ __global__ void shadeBSDF(
             else {
                 glm::vec3 incoming = glm::normalize(pathSegment.ray.direction);
                 glm::vec3 geometricNormal = glm::normalize(intersection.surfaceNormal);
+                if (hitGeom.type == TRIANGLE && hitGeom.hasTextureCoordinates)
+                {
+                    geometricNormal = sampleNormalTexture(material, hitGeom, intersection.surfaceUV,
+                        geometricNormal, textureStore);
+                }
                 bool enteringDielectric = glm::dot(incoming, geometricNormal) < 0.0f;
                 glm::vec3 normal = geometricNormal;
                 if (!enteringDielectric)
@@ -1190,6 +1353,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_lightPrimitives,
             dev_lightPrimitiveCount,
             dev_environment,
+            dev_textureStore,
             totalLightCount,
             dev_bvhNodes,
             static_cast<int>(hst_scene->bvhNodes.size()),

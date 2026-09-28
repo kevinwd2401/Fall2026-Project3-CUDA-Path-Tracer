@@ -19,6 +19,9 @@ public:
     std::vector<int> bvhPrimitiveIndices;
     std::vector<Material> materials;
     std::vector<int> emissivePrimitives;
+    // glTF texture descriptors and their RGBA texels.
+    std::vector<TextureInfo> textures;
+    std::vector<glm::vec4> textureTexels;
     // An equirectangular, linear HDR image and the precomputed probability
     // distribution used to sample it as a directional light.
     struct EnvironmentMap
