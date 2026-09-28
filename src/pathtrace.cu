@@ -19,7 +19,14 @@
 #include "interactions.h"
 #include "tonemapping.h"
 
+#ifndef MATERIAL_SORT
 #define MATERIAL_SORT 0
+#endif
+// Morton ordering schedules both closest-hit and shadow traversal by ray
+// origin/direction. Material sorting remains independently available for shading.
+#ifndef MORTON_SORT
+#define MORTON_SORT 1
+#endif
 #define RUSSIAN_ROULETTE 1
 #define RUSSIAN_ROULETTE_START_DEPTH 3
 #define DEPTH_OF_FIELD 1
@@ -88,8 +95,13 @@ static glm::vec3* dev_image = NULL;
 static PrimitiveRef* dev_primitives = NULL;
 static Cube* dev_cubes = NULL;
 static Sphere* dev_spheres = NULL;
-static Triangle* dev_triangles = NULL;
-static BVHNode* dev_bvhNodes = NULL;
+static glm::vec3* dev_triangleVertices = NULL;
+static glm::vec3* dev_triangleEdges1 = NULL;
+static glm::vec3* dev_triangleEdges2 = NULL;
+static TriangleAttributes* dev_triangleAttributes = NULL;
+static glm::vec3* dev_bvhBoundsMin = NULL;
+static glm::vec3* dev_bvhBoundsMax = NULL;
+static int3* dev_bvhLinks = NULL;
 static int* dev_bvhPrimitiveIndices = NULL;
 static Material* dev_materials = NULL;
 static int* dev_lightPrimitives = NULL;
@@ -139,14 +151,36 @@ struct DevicePrimitiveStore
     const PrimitiveRef* primitives = NULL;
     const Cube* cubes = NULL;
     const Sphere* spheres = NULL;
-    const Triangle* triangles = NULL;
+    TriangleSoA triangles{};
 };
 
 static DevicePrimitiveStore dev_primitiveStore;
 
-// A fixed-width queue: a shading thread owns the slot at its current path
-// index. Inactive entries
-// are skipped by the dedicated shadow traversal kernel.
+// Uniform, read-only descriptors live in constant memory so each traversal
+// thread does not carry a large store argument. Node bounds are separate from
+// leaf/topology metadata; the host builder retains its convenient AoS layout.
+struct TraversalData
+{
+    const PrimitiveRef* primitives;
+    const Cube* cubes;
+    const Sphere* spheres;
+    const glm::vec3* vertices;
+    const glm::vec3* edges1;
+    const glm::vec3* edges2;
+    const glm::vec3* boundsMin;
+    const glm::vec3* boundsMax;
+    const int3* links; // firstPrimitive, primitiveCount, escapeIndex
+    const int* primitiveIndices;
+    int nodeCount;
+};
+
+__constant__ TraversalData traversalData;
+
+static glm::vec3 mortonBoundsMin(0.0f);
+static glm::vec3 mortonInverseExtent(0.0f);
+
+// A shading thread owns the slot at its current path index. Inactive entries
+// are compacted away before the dedicated shadow traversal kernel.
 struct ShadowRay
 {
     Ray ray;
@@ -161,8 +195,20 @@ static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 static ShadowRay* dev_shadowRays = NULL;
 static int* dev_materialSortKeys = NULL;
-// TODO: static variables for device memory, any extra info you need, etc
-// ...
+static unsigned int* dev_mortonSortKeys = NULL;
+static int* dev_rayOrder = NULL;
+
+template <typename T>
+T* uploadArray(const std::vector<T>& values)
+{
+    T* device = NULL;
+    if (!values.empty())
+    {
+        cudaMalloc(&device, values.size() * sizeof(T));
+        cudaMemcpy(device, values.data(), values.size() * sizeof(T), cudaMemcpyHostToDevice);
+    }
+    return device;
+}
 
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
@@ -195,19 +241,65 @@ void pathtraceInit(Scene* scene)
     }
     if (!scene->triangles.empty())
     {
-        cudaMalloc(&dev_triangles, scene->triangles.size() * sizeof(Triangle));
-        cudaMemcpy(dev_triangles, scene->triangles.data(), scene->triangles.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
+        std::vector<glm::vec3> vertices, edges1, edges2;
+        std::vector<TriangleAttributes> attributes;
+        vertices.reserve(scene->triangles.size());
+        edges1.reserve(scene->triangles.size());
+        edges2.reserve(scene->triangles.size());
+        attributes.reserve(scene->triangles.size());
+        for (const Triangle& triangle : scene->triangles)
+        {
+            vertices.push_back(triangle.triangleVertices[0]);
+            edges1.push_back(triangle.triangleVertices[1] - triangle.triangleVertices[0]);
+            edges2.push_back(triangle.triangleVertices[2] - triangle.triangleVertices[0]);
+            TriangleAttributes attribute{};
+            attribute.materialid = triangle.materialid;
+            attribute.hasVertexNormals = triangle.hasVertexNormals;
+            attribute.hasTextureCoordinates = triangle.hasTextureCoordinates;
+            for (int corner = 0; corner < 3; ++corner)
+            {
+                attribute.triangleNormals[corner] = triangle.triangleNormals[corner];
+                attribute.triangleUVs[corner] = triangle.triangleUVs[corner];
+            }
+            attributes.push_back(attribute);
+        }
+        dev_triangleVertices = uploadArray(vertices);
+        dev_triangleEdges1 = uploadArray(edges1);
+        dev_triangleEdges2 = uploadArray(edges2);
+        dev_triangleAttributes = uploadArray(attributes);
     }
-    dev_primitiveStore = { dev_primitives, dev_cubes, dev_spheres, dev_triangles };
+    dev_primitiveStore = { dev_primitives, dev_cubes, dev_spheres,
+        { dev_triangleVertices, dev_triangleEdges1, dev_triangleEdges2, dev_triangleAttributes } };
 
+    mortonBoundsMin = glm::vec3(0.0f);
+    mortonInverseExtent = glm::vec3(0.0f);
     if (!scene->bvhNodes.empty())
     {
-        cudaMalloc(&dev_bvhNodes, scene->bvhNodes.size() * sizeof(BVHNode));
-        cudaMemcpy(dev_bvhNodes, scene->bvhNodes.data(), scene->bvhNodes.size() * sizeof(BVHNode), cudaMemcpyHostToDevice);
-        cudaMalloc(&dev_bvhPrimitiveIndices, scene->bvhPrimitiveIndices.size() * sizeof(int));
-        cudaMemcpy(dev_bvhPrimitiveIndices, scene->bvhPrimitiveIndices.data(),
-            scene->bvhPrimitiveIndices.size() * sizeof(int), cudaMemcpyHostToDevice);
+        std::vector<glm::vec3> lower, upper;
+        std::vector<int3> links;
+        lower.reserve(scene->bvhNodes.size());
+        upper.reserve(scene->bvhNodes.size());
+        links.reserve(scene->bvhNodes.size());
+        for (const BVHNode& node : scene->bvhNodes)
+        {
+            lower.push_back(node.boundsMin);
+            upper.push_back(node.boundsMax);
+            links.push_back(make_int3(node.firstPrimitive, node.primitiveCount, node.escapeIndex));
+        }
+        dev_bvhBoundsMin = uploadArray(lower);
+        dev_bvhBoundsMax = uploadArray(upper);
+        dev_bvhLinks = uploadArray(links);
+        dev_bvhPrimitiveIndices = uploadArray(scene->bvhPrimitiveIndices);
+        mortonBoundsMin = scene->bvhNodes[0].boundsMin;
+        const glm::vec3 extent = scene->bvhNodes[0].boundsMax - mortonBoundsMin;
+        for (int axis = 0; axis < 3; ++axis)
+            mortonInverseExtent[axis] = extent[axis] > 1e-8f ? 1.0f / extent[axis] : 0.0f;
     }
+    const TraversalData traversal = { dev_primitives, dev_cubes, dev_spheres,
+        dev_triangleVertices, dev_triangleEdges1, dev_triangleEdges2,
+        dev_bvhBoundsMin, dev_bvhBoundsMax, dev_bvhLinks, dev_bvhPrimitiveIndices,
+        static_cast<int>(scene->bvhNodes.size()) };
+    cudaMemcpyToSymbol(traversalData, &traversal, sizeof(traversal));
 
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
@@ -256,7 +348,13 @@ void pathtraceInit(Scene* scene)
 
     cudaMalloc(&dev_shadowRays, pixelcount * sizeof(ShadowRay));
 
+#if MATERIAL_SORT
     cudaMalloc(&dev_materialSortKeys, pixelcount * sizeof(int));
+#endif
+#if MORTON_SORT
+    cudaMalloc(&dev_mortonSortKeys, pixelcount * sizeof(unsigned int));
+    cudaMalloc(&dev_rayOrder, pixelcount * sizeof(int));
+#endif
 
     checkCUDAError("pathtraceInit");
 }
@@ -268,8 +366,13 @@ void pathtraceFree()
     cudaFree(dev_primitives);
     cudaFree(dev_cubes);
     cudaFree(dev_spheres);
-    cudaFree(dev_triangles);
-    cudaFree(dev_bvhNodes);
+    cudaFree(dev_triangleVertices);
+    cudaFree(dev_triangleEdges1);
+    cudaFree(dev_triangleEdges2);
+    cudaFree(dev_triangleAttributes);
+    cudaFree(dev_bvhBoundsMin);
+    cudaFree(dev_bvhBoundsMax);
+    cudaFree(dev_bvhLinks);
     cudaFree(dev_bvhPrimitiveIndices);
     cudaFree(dev_materials);
     cudaFree(dev_lightPrimitives);
@@ -282,6 +385,8 @@ void pathtraceFree()
     cudaFree(dev_intersections);
     cudaFree(dev_shadowRays);
     cudaFree(dev_materialSortKeys);
+    cudaFree(dev_mortonSortKeys);
+    cudaFree(dev_rayOrder);
     dev_environmentTexels = NULL;
     dev_environmentAliasProbability = NULL;
     dev_environmentAliasIndex = NULL;
@@ -294,9 +399,25 @@ void pathtraceFree()
     dev_primitives = NULL;
     dev_cubes = NULL;
     dev_spheres = NULL;
-    dev_triangles = NULL;
+    dev_triangleVertices = NULL;
+    dev_triangleEdges1 = NULL;
+    dev_triangleEdges2 = NULL;
+    dev_triangleAttributes = NULL;
     dev_primitiveStore = DevicePrimitiveStore{};
     dev_shadowRays = NULL;
+    dev_image = NULL;
+    dev_paths = NULL;
+    dev_intersections = NULL;
+    dev_bvhBoundsMin = NULL;
+    dev_bvhBoundsMax = NULL;
+    dev_bvhLinks = NULL;
+    dev_bvhPrimitiveIndices = NULL;
+    dev_materials = NULL;
+    dev_lightPrimitives = NULL;
+    dev_lightPrimitiveCount = 0;
+    dev_materialSortKeys = NULL;
+    dev_mortonSortKeys = NULL;
+    dev_rayOrder = NULL;
 
     checkCUDAError("pathtraceFree");
 }
@@ -361,21 +482,20 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
     }
 }
 
-// TODO:
-// computeIntersections handles generating ray intersections ONLY.
-// Generating new rays is handled in your shader(s).
-// Feel free to modify the code below.
-__device__ float intersectPrimitive(const PrimitiveRef& primitive, const DevicePrimitiveStore& primitiveStore,
-    const Ray& ray, glm::vec3& intersectionPoint, glm::vec3& normal, glm::vec2& uv, bool& outside)
+// Distance-only primitive dispatch.
+__device__ __forceinline__ float intersectPrimitiveDistance(const PrimitiveRef& primitive,
+    const Ray& ray, float maxDistance, glm::vec2& barycentrics)
 {
     switch (primitive.type)
     {
     case CUBE:
-        return boxIntersectionTest(primitiveStore.cubes[primitive.index], ray, intersectionPoint, normal, outside);
+        return boxDistanceTest(traversalData.cubes[primitive.index], ray, maxDistance);
     case SPHERE:
-        return sphereIntersectionTest(primitiveStore.spheres[primitive.index], ray, intersectionPoint, normal, outside);
+        return sphereDistanceTest(traversalData.spheres[primitive.index], ray, maxDistance);
     case TRIANGLE:
-        return triangleIntersectionTest(primitiveStore.triangles[primitive.index], ray, intersectionPoint, normal, uv, outside);
+        return triangleDistanceTest(traversalData.vertices[primitive.index],
+            traversalData.edges1[primitive.index], traversalData.edges2[primitive.index],
+            ray, maxDistance, barycentrics);
     }
     return -1.0f;
 }
@@ -386,94 +506,57 @@ __device__ int primitiveMaterialId(const PrimitiveRef& primitive, const DevicePr
     {
     case CUBE: return primitiveStore.cubes[primitive.index].materialid;
     case SPHERE: return primitiveStore.spheres[primitive.index].materialid;
-    case TRIANGLE: return primitiveStore.triangles[primitive.index].materialid;
+    case TRIANGLE: return primitiveStore.triangles.attributes[primitive.index].materialid;
     }
     return -1;
 }
 
-__global__ void computeIntersections(
-    int depth,
-    int num_paths,
-    PathSegment* pathSegments,
-    DevicePrimitiveStore primitiveStore,
-    const BVHNode* bvhNodes,
-    int bvhNodeCount,
-    const int* bvhPrimitiveIndices,
-    ShadeableIntersection* intersections)
+__global__ void computeIntersections(int numPaths, const PathSegment* pathSegments,
+    const int* rayOrder, ShadeableIntersection* intersections)
 {
-    int path_index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (path_index < num_paths)
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lane >= numPaths) return;
+    const int pathIndex = rayOrder ? rayOrder[lane] : lane;
+    // Load only the six ray floats, never the full path/throughput payload.
+    const Ray ray = pathSegments[pathIndex].ray;
+    const glm::vec3 inverseDirection = rayInverseDirection(ray);
+    float closest = FLT_MAX;
+    int hitPrimitive = -1;
+    glm::vec2 hitBarycentrics(0.0f);
+    int nodeIndex = 0;
+    while (nodeIndex < traversalData.nodeCount)
     {
-        PathSegment pathSegment = pathSegments[path_index];
-
-        glm::vec3 normal;
-        float t_min = FLT_MAX;
-        int hit_primitive_index = -1;
-
-        glm::vec3 tmp_intersect;
-        glm::vec3 tmp_normal;
-        glm::vec2 hit_uv(0.0f);
-
-
-        //bvh traversal
-        int nodeIndex = 0;
-        while (nodeIndex < bvhNodeCount)
+        if (!traversalBoundsTest(ray, inverseDirection, traversalData.boundsMin[nodeIndex],
+            traversalData.boundsMax[nodeIndex], closest))
         {
-            const BVHNode& node = bvhNodes[nodeIndex];
-            float boxEntryDistance;
-            if (!aabbIntersectionTest(pathSegment.ray, node.boundsMin, node.boundsMax,
-                t_min, boxEntryDistance))
-            {
-                nodeIndex = node.escapeIndex;
-                continue;
-            }
-
-            if (node.primitiveCount == 0)
-            {
-                // Nodes are stored depth-first, so the left child is next.
-                ++nodeIndex;
-                continue;
-            }
-
-            for (int primitiveOffset = 0; primitiveOffset < node.primitiveCount; ++primitiveOffset)
-            {
-                const int primitiveIndex = bvhPrimitiveIndices[node.firstPrimitive + primitiveOffset];
-                const PrimitiveRef& primitive = primitiveStore.primitives[primitiveIndex];
-                bool outside = true;
-                float t = -1.0f;
-                glm::vec2 candidateUV(0.0f);
-
-                t = intersectPrimitive(primitive, primitiveStore, pathSegment.ray,
-                    tmp_intersect, tmp_normal, candidateUV, outside);
-
-                if (t > 0.0f && t_min > t)
-                {
-                    t_min = t;
-                    hit_primitive_index = primitiveIndex;
-                    normal = tmp_normal;
-                    hit_uv = candidateUV;
-                }
-            }
-            nodeIndex = node.escapeIndex;
+            nodeIndex = traversalData.links[nodeIndex].z;
+            continue;
         }
-
-        if (hit_primitive_index == -1)
+        const int3 links = traversalData.links[nodeIndex];
+        if (links.y == 0)
         {
-            intersections[path_index].t = -1.0f;
-            intersections[path_index].primitiveIndex = -1;
+            ++nodeIndex;
+            continue;
         }
-        else
+        for (int offset = 0; offset < links.y; ++offset)
         {
-            // The ray hits something
-            intersections[path_index].t = t_min;
-            intersections[path_index].materialId = primitiveMaterialId(
-                primitiveStore.primitives[hit_primitive_index], primitiveStore);
-            intersections[path_index].surfaceNormal = normal;
-            intersections[path_index].surfaceUV = hit_uv;
-            intersections[path_index].primitiveIndex = hit_primitive_index;
+            const int primitiveIndex = traversalData.primitiveIndices[links.x + offset];
+            glm::vec2 barycentrics(0.0f);
+            const float t = intersectPrimitiveDistance(traversalData.primitives[primitiveIndex],
+                ray, closest, barycentrics);
+            if (t > 0.0f)
+            {
+                closest = t;
+                hitPrimitive = primitiveIndex;
+                hitBarycentrics = barycentrics;
+            }
         }
+        nodeIndex = links.z;
     }
+    ShadeableIntersection& hit = intersections[pathIndex];
+    hit.t = hitPrimitive < 0 ? -1.0f : closest;
+    hit.primitiveIndex = hitPrimitive;
+    hit.barycentrics = hitBarycentrics;
 }
 
 __device__ void bsdfCoordinateSystem(
@@ -579,10 +662,9 @@ __device__ glm::vec3 lightSurfaceNormal(const PrimitiveRef& primitive,
 {
     if (primitive.type == TRIANGLE)
     {
-        const Triangle& triangle = primitiveStore.triangles[primitive.index];
         return glm::normalize(glm::cross(
-            triangle.triangleVertices[1] - triangle.triangleVertices[0],
-            triangle.triangleVertices[2] - triangle.triangleVertices[0]));
+            primitiveStore.triangles.edges1[primitive.index],
+            primitiveStore.triangles.edges2[primitive.index]));
     }
 
     if (primitive.type == SPHERE)
@@ -610,10 +692,9 @@ __device__ float primitiveSurfaceAreaPdf(const PrimitiveRef& primitive,
 {
     if (primitive.type == TRIANGLE)
     {
-        const Triangle& triangle = primitiveStore.triangles[primitive.index];
         const float area = 0.5f * glm::length(glm::cross(
-            triangle.triangleVertices[1] - triangle.triangleVertices[0],
-            triangle.triangleVertices[2] - triangle.triangleVertices[0]));
+            primitiveStore.triangles.edges1[primitive.index],
+            primitiveStore.triangles.edges2[primitive.index]));
         return area > EPSILON ? 1.0f / area : 0.0f;
     }
 
@@ -647,11 +728,12 @@ __device__ LightSurfaceSample sampleLightSurface(const PrimitiveRef& primitive,
 
     if (primitive.type == TRIANGLE)
     {
-        const Triangle& triangle = primitiveStore.triangles[primitive.index];
+        const TriangleSoA& triangles = primitiveStore.triangles;
         const float rootU = sqrtf(u01(rng));
         const float v = u01(rng);
-        sample.position = (1.0f - rootU) * triangle.triangleVertices[0] +
-            rootU * (1.0f - v) * triangle.triangleVertices[1] + rootU * v * triangle.triangleVertices[2];
+        sample.position = triangles.vertices[primitive.index] +
+            rootU * (1.0f - v) * triangles.edges1[primitive.index] +
+            rootU * v * triangles.edges2[primitive.index];
         sample.normal = lightSurfaceNormal(primitive, primitiveStore, sample.position);
     }
     else if (primitive.type == SPHERE)
@@ -776,36 +858,33 @@ __device__ EnvironmentSample sampleEnvironment(const DeviceEnvironmentMap& envir
     return sample;
 }
 
-__device__ bool isOccluded(const Ray& ray, float maxDistance, const DevicePrimitiveStore& primitiveStore,
-    const BVHNode* bvhNodes, int bvhNodeCount, const int* bvhPrimitiveIndices)
+__device__ __forceinline__ bool isOccluded(const Ray& ray, float maxDistance)
 {
+    const glm::vec3 inverseDirection = rayInverseDirection(ray);
     int nodeIndex = 0;
-    while (nodeIndex < bvhNodeCount)
+    while (nodeIndex < traversalData.nodeCount)
     {
-        const BVHNode& node = bvhNodes[nodeIndex];
-        float entryDistance;
-        if (!aabbIntersectionTest(ray, node.boundsMin, node.boundsMax, maxDistance, entryDistance))
+        if (!traversalBoundsTest(ray, inverseDirection, traversalData.boundsMin[nodeIndex],
+            traversalData.boundsMax[nodeIndex], maxDistance))
         {
-            nodeIndex = node.escapeIndex;
+            nodeIndex = traversalData.links[nodeIndex].z;
             continue;
         }
-        if (node.primitiveCount == 0)
+        const int3 links = traversalData.links[nodeIndex];
+        if (links.y == 0)
         {
             ++nodeIndex;
             continue;
         }
-        for (int offset = 0; offset < node.primitiveCount; ++offset)
+        for (int offset = 0; offset < links.y; ++offset)
         {
-            const PrimitiveRef& primitive = primitiveStore.primitives[
-                bvhPrimitiveIndices[node.firstPrimitive + offset]];
-            glm::vec3 ignoredPoint, ignoredNormal;
-            glm::vec2 ignoredUV;
-            bool outside;
-            const float t = intersectPrimitive(primitive, primitiveStore, ray,
-                ignoredPoint, ignoredNormal, ignoredUV, outside);
-            if (t > 1e-4f && t < maxDistance) return true;
+            const PrimitiveRef& primitive = traversalData.primitives[
+                traversalData.primitiveIndices[links.x + offset]];
+            glm::vec2 unusedBarycentrics;
+            if (intersectPrimitiveDistance(primitive, ray, maxDistance, unusedBarycentrics) > 0.0f)
+                return true;
         }
-        nodeIndex = node.escapeIndex;
+        nodeIndex = links.z;
     }
     return false;
 }
@@ -890,9 +969,11 @@ __device__ glm::vec4 sampleBaseColorTexture(const Material& material, const glm:
         srgbToLinear(sampled.b), sampled.a);
 }
 
-__device__ glm::vec3 sampleNormalTexture(const Material& material, const Triangle& triangle,
+__device__ glm::vec3 sampleNormalTexture(const Material& material, const TriangleSoA& triangles,
+    int triangleIndex,
     const glm::vec2& uv, glm::vec3 geometricNormal, const DeviceTextureStore& textureStore)
 {
+    const TriangleAttributes& triangle = triangles.attributes[triangleIndex];
     if (!textureStore.validTextureIndex(material.normalTexture) || !triangle.hasTextureCoordinates)
         return geometricNormal;
 
@@ -904,8 +985,8 @@ __device__ glm::vec3 sampleNormalTexture(const Material& material, const Triangl
     if (glm::length2(tangentSpaceNormal) <= EPSILON) return geometricNormal;
     tangentSpaceNormal = glm::normalize(tangentSpaceNormal);
 
-    const glm::vec3 edge1 = triangle.triangleVertices[1] - triangle.triangleVertices[0];
-    const glm::vec3 edge2 = triangle.triangleVertices[2] - triangle.triangleVertices[0];
+    const glm::vec3& edge1 = triangles.edges1[triangleIndex];
+    const glm::vec3& edge2 = triangles.edges2[triangleIndex];
     const glm::vec2 uv1 = triangle.triangleUVs[1] - triangle.triangleUVs[0];
     const glm::vec2 uv2 = triangle.triangleUVs[2] - triangle.triangleUVs[0];
     const float determinant = uv1.x * uv2.y - uv1.y * uv2.x;
@@ -1042,7 +1123,7 @@ __device__ void enqueueDirectLighting(const Material& material, const PathSegmen
     const glm::vec3 wi = toLight / distance;
     const float cosSurface = fmaxf(0.0f, glm::dot(offsetNormal, wi));
     // Emissive primitives radiate from their front side only.  Their front
-    // side is the outward primitive normal (or triangle winding normal).
+    // side is the outward primitive normal.
     const float cosLight = glm::dot(sample.normal, -wi);
     if (cosSurface <= 0.0f || cosLight <= EPSILON) return;
 
@@ -1084,20 +1165,31 @@ __global__ void shadeBSDF(
         // The queue is reused for every bounce; paths that do not sample a
         // non-delta direct-light strategy leave an inactive entry.
         shadowRays[idx].active = 0;
-        ShadeableIntersection intersection = shadeableIntersections[idx];
+        const ShadeableIntersection& intersection = shadeableIntersections[idx];
         if (intersection.t > 0.0f)
         {
-            Material material = materials[intersection.materialId];
             PathSegment pathSegment = pathSegments[idx];
             const PrimitiveRef& hitPrimitive = primitiveStore.primitives[intersection.primitiveIndex];
-
+            Material material = materials[primitiveMaterialId(hitPrimitive, primitiveStore)];
+            glm::vec2 surfaceUV(0.0f);
+            if (hitPrimitive.type == TRIANGLE)
+            {
+                const TriangleAttributes& attributes = primitiveStore.triangles.attributes[hitPrimitive.index];
+                if (attributes.hasTextureCoordinates)
+                {
+                    const float u = intersection.barycentrics.x;
+                    const float v = intersection.barycentrics.y;
+                    surfaceUV = (1.0f - u - v) * attributes.triangleUVs[0] +
+                        u * attributes.triangleUVs[1] + v * attributes.triangleUVs[2];
+                }
+            }
 
             // Sample texture for color and alpha
             glm::vec4 baseColorSample(1.0f);
             if (hitPrimitive.type == TRIANGLE &&
-                primitiveStore.triangles[hitPrimitive.index].hasTextureCoordinates)
+                primitiveStore.triangles.attributes[hitPrimitive.index].hasTextureCoordinates)
             {
-                baseColorSample = sampleBaseColorTexture(material, intersection.surfaceUV, textureStore);
+                baseColorSample = sampleBaseColorTexture(material, surfaceUV, textureStore);
                 material.color *= glm::vec3(baseColorSample);
             }
 
@@ -1152,11 +1244,24 @@ __global__ void shadeBSDF(
             }
             else {
                 glm::vec3 incoming = glm::normalize(pathSegment.ray.direction);
-                glm::vec3 geometricNormal = glm::normalize(intersection.surfaceNormal);
-                if (hitPrimitive.type == TRIANGLE &&
-                    primitiveStore.triangles[hitPrimitive.index].hasTextureCoordinates)
+                const glm::vec3 hitPoint = pathSegment.ray.origin + intersection.t * pathSegment.ray.direction;
+                glm::vec3 geometricNormal = lightSurfaceNormal(hitPrimitive, primitiveStore, hitPoint);
+                if (hitPrimitive.type == TRIANGLE)
                 {
-                    geometricNormal = sampleNormalTexture(material, primitiveStore.triangles[hitPrimitive.index], intersection.surfaceUV,
+                    const TriangleAttributes& attributes = primitiveStore.triangles.attributes[hitPrimitive.index];
+                    if (attributes.hasVertexNormals)
+                    {
+                        const float u = intersection.barycentrics.x;
+                        const float v = intersection.barycentrics.y;
+                        const glm::vec3 normal = (1.0f - u - v) * attributes.triangleNormals[0] +
+                            u * attributes.triangleNormals[1] + v * attributes.triangleNormals[2];
+                        if (glm::dot(normal, normal) >= 1e-16f) geometricNormal = glm::normalize(normal);
+                    }
+                }
+                if (hitPrimitive.type == TRIANGLE &&
+                    primitiveStore.triangles.attributes[hitPrimitive.index].hasTextureCoordinates)
+                {
+                    geometricNormal = sampleNormalTexture(material, primitiveStore.triangles, hitPrimitive.index, surfaceUV,
                         geometricNormal, textureStore);
                 }
                 bool enteringDielectric = glm::dot(incoming, geometricNormal) < 0.0f;
@@ -1308,17 +1413,14 @@ __global__ void shadeBSDF(
 __global__ void traceShadowRays(
     int numShadowRays,
     ShadowRay* shadowRays,
-    DevicePrimitiveStore primitiveStore,
-    const BVHNode* bvhNodes,
-    int bvhNodeCount,
-    const int* bvhPrimitiveIndices)
+    const int* rayOrder)
 {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= numShadowRays || !shadowRays[index].active) return;
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lane >= numShadowRays) return;
+    const int index = rayOrder ? rayOrder[lane] : lane;
 
-    ShadowRay& shadowRay = shadowRays[index];
-    shadowRay.occluded = isOccluded(shadowRay.ray, shadowRay.maxDistance,
-        primitiveStore, bvhNodes, bvhNodeCount, bvhPrimitiveIndices) ? 1 : 0;
+    const Ray ray = shadowRays[index].ray;
+    shadowRays[index].occluded = isOccluded(ray, shadowRays[index].maxDistance) ? 1 : 0;
 }
 
 // A path owns at most one queue entry per bounce, so these writes are
@@ -1343,17 +1445,19 @@ __global__ void buildMaterialSortKeys(
     int material_count,
     ShadeableIntersection* shadeableIntersections,
     Material* materials,
+    DevicePrimitiveStore primitiveStore,
     int* materialSortKeys)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < num_paths)
     {
-        ShadeableIntersection intersection = shadeableIntersections[idx];
+        const ShadeableIntersection& intersection = shadeableIntersections[idx];
         if (intersection.t > 0.0f)
         {
-            Material material = materials[intersection.materialId];
-            materialSortKeys[idx] = static_cast<int>(material.type) * material_count + intersection.materialId;
+            const int materialId = primitiveMaterialId(
+                primitiveStore.primitives[intersection.primitiveIndex], primitiveStore);
+            materialSortKeys[idx] = static_cast<int>(materials[materialId].type) * material_count + materialId;
         }
         else
         {
@@ -1361,6 +1465,49 @@ __global__ void buildMaterialSortKeys(
         }
     }
 }
+
+#if MORTON_SORT
+__device__ __forceinline__ unsigned int spreadMortonBits(unsigned int value)
+{
+    value = (value | (value << 16)) & 0x030000ffu;
+    value = (value | (value << 8)) & 0x0300f00fu;
+    value = (value | (value << 4)) & 0x030c30c3u;
+    return (value | (value << 2)) & 0x09249249u;
+}
+
+__device__ __forceinline__ unsigned int mortonCode(const glm::vec3& value, float bins)
+{
+    const unsigned int x = static_cast<unsigned int>(fminf(bins - 1.0f, fmaxf(0.0f, value.x * bins)));
+    const unsigned int y = static_cast<unsigned int>(fminf(bins - 1.0f, fmaxf(0.0f, value.y * bins)));
+    const unsigned int z = static_cast<unsigned int>(fminf(bins - 1.0f, fmaxf(0.0f, value.z * bins)));
+    return spreadMortonBits(x) | (spreadMortonBits(y) << 1) | (spreadMortonBits(z) << 2);
+}
+
+// 18 origin bits (64 cells/axis) followed by 12 direction bits (16 bins/axis).
+// Camera rays sharing an origin are consequently ordered by direction too.
+// Sort indices only: paths, hits, pixel seeds, and shadow ownership stay paired.
+template <typename RayPayload>
+__global__ void buildMortonSortKeys(int count, const RayPayload* rays,
+    glm::vec3 boundsMin, glm::vec3 inverseExtent, unsigned int* keys, int* order)
+{
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const Ray& ray = rays[index].ray;
+    const unsigned int origin = mortonCode((ray.origin - boundsMin) * inverseExtent, 64.0f);
+    const unsigned int direction = mortonCode(0.5f * ray.direction + glm::vec3(0.5f), 16.0f);
+    keys[index] = (origin << 12) | direction;
+    order[index] = index;
+}
+
+template <typename RayPayload>
+void orderRays(int count, const RayPayload* rays, int blockSize)
+{
+    buildMortonSortKeys<<<(count + blockSize - 1) / blockSize, blockSize>>>(
+        count, rays, mortonBoundsMin, mortonInverseExtent, dev_mortonSortKeys, dev_rayOrder);
+    thrust::sort_by_key(thrust::device, dev_mortonSortKeys, dev_mortonSortKeys + count, dev_rayOrder);
+    checkCUDAError("sort traversal rays by Morton code");
+}
+#endif
 
 // Add the current iteration's output to the overall image
 __global__ void finalGather(int nPaths, glm::vec3* image, PathSegment* iterationPaths)
@@ -1436,26 +1583,21 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // --- PathSegment Tracing Stage ---
     // Shoot ray into scene, bounce between objects, push shading chunks
 
-    bool iterationComplete = false;
+    bool iterationComplete = num_paths == 0;
     while (!iterationComplete)
     {
-        // clean shading chunks
-        //cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
-
         // tracing
         dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
+#if MORTON_SORT
+        orderRays(num_paths, dev_paths, blockSize1d);
+#endif
         computeIntersections<<<numblocksPathSegmentTracing, blockSize1d>>> (
-            depth,
             num_paths,
             dev_paths,
-            dev_primitiveStore,
-            dev_bvhNodes,
-            static_cast<int>(hst_scene->bvhNodes.size()),
-            dev_bvhPrimitiveIndices,
+            dev_rayOrder,
             dev_intersections
         );
         checkCUDAError("trace one bounce");
-        cudaDeviceSynchronize();
         depth++;
 
         // --- Shading Stage ---
@@ -1472,6 +1614,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             hst_scene->materials.size(),
             dev_intersections,
             dev_materials,
+            dev_primitiveStore,
             dev_materialSortKeys
         );
         checkCUDAError("build material sort keys");
@@ -1516,13 +1659,13 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         if (numShadowRays > 0)
         {
             const dim3 shadowBlocks = (numShadowRays + blockSize1d - 1) / blockSize1d;
+#if MORTON_SORT
+            orderRays(numShadowRays, dev_shadowRays, blockSize1d);
+#endif
             traceShadowRays<<<shadowBlocks, blockSize1d>>>(
                 numShadowRays,
                 dev_shadowRays,
-                dev_primitiveStore,
-                dev_bvhNodes,
-                static_cast<int>(hst_scene->bvhNodes.size()),
-                dev_bvhPrimitiveIndices
+                dev_rayOrder
             );
             checkCUDAError("trace shadow rays");
 

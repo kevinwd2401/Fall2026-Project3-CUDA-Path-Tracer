@@ -76,8 +76,27 @@ struct Triangle
     int hasTextureCoordinates;
 };
 
-// A flat, depth-first BVH node shared verbatim by the CPU builder and CUDA
-// traversal code.  Leaves have primitiveCount > 0 and reference a range in
+// Device-only triangle layout. Traversal reads three independent position/
+// edge arrays; interpolation and texture data are fetched only after a hit.
+struct TriangleAttributes
+{
+    int materialid;
+    glm::vec3 triangleNormals[3];
+    glm::vec2 triangleUVs[3];
+    int hasVertexNormals;
+    int hasTextureCoordinates;
+};
+
+struct TriangleSoA
+{
+    const glm::vec3* vertices;
+    const glm::vec3* edges1;
+    const glm::vec3* edges2;
+    const TriangleAttributes* attributes;
+};
+
+// A flat, depth-first CPU BVH node, split into bound and link arrays at upload.
+// Leaves have primitiveCount > 0 and reference a range in
 // Scene::bvhPrimitiveIndices.  Internal nodes have primitiveCount == 0.
 //
 // escapeIndex makes the tree stackless on the GPU: after a node (and all of
@@ -169,8 +188,8 @@ struct PathSegment
 struct ShadeableIntersection
 {
   float t;
-  glm::vec3 surfaceNormal;
-  glm::vec2 surfaceUV;
-  int materialId;
+  // Triangle barycentrics
+  // Normals and UVs are reconstructed once in shading, outside traversal.
+  glm::vec2 barycentrics;
   int primitiveIndex;
 };
