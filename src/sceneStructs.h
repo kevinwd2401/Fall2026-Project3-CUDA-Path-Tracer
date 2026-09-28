@@ -33,20 +33,35 @@ struct Ray
     glm::vec3 direction;
 };
 
-struct Geom
+struct PrimitiveRef
 {
-    enum GeomType type;
+    GeomType type;
+    int index;
+};
+
+// Each primitive list only stores the data needed by that geometry type.
+// PrimitiveRef provides the stable scene-wide identity used by the BVH,
+// intersections, and emissive-primitive list.
+struct Cube
+{
     int materialid;
-    glm::vec3 translation;
-    glm::vec3 rotation;
-    glm::vec3 scale;
     glm::mat4 transform;
     glm::mat4 inverseTransform;
     glm::mat4 invTranspose;
+};
 
-    // glTF meshes are flattened into world-space triangles before they are
-    // copied to the device.  Keeping them in Geom lets the existing primitive
-    // upload and nearest-hit loop serve analytic and mesh primitives alike.
+struct Sphere
+{
+    int materialid;
+    glm::mat4 transform;
+    glm::mat4 inverseTransform;
+    glm::mat4 invTranspose;
+};
+
+// glTF meshes are flattened into world-space triangles before upload.
+struct Triangle
+{
+    int materialid;
     glm::vec3 triangleVertices[3];
     glm::vec3 triangleNormals[3];
     glm::vec2 triangleUVs[3];

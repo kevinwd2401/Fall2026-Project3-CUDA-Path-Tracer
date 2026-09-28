@@ -88,7 +88,7 @@ __host__ __device__ inline bool aabbIntersectionTest(
  * @return                   Ray parameter `t` value. -1 if no intersection.
  */
 __host__ __device__ float boxIntersectionTest(
-    Geom box,
+    Cube box,
     Ray r,
     glm::vec3& intersectionPoint,
     glm::vec3& normal,
@@ -105,15 +105,15 @@ __host__ __device__ float boxIntersectionTest(
  * @return                   Ray parameter `t` value. -1 if no intersection.
  */
 __host__ __device__ float sphereIntersectionTest(
-    Geom sphere,
+    Sphere sphere,
     Ray r,
     glm::vec3& intersectionPoint,
     glm::vec3& normal,
     bool& outside);
 
-/** Test a ray against a world-space triangle stored in a Geom. */
+/** Test a ray against a world-space triangle. */
 __host__ __device__ float triangleIntersectionTest(
-    Geom triangle,
+    Triangle triangle,
     Ray r,
     glm::vec3& intersectionPoint,
     glm::vec3& normal,

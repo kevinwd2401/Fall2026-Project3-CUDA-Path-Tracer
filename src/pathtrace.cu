@@ -85,7 +85,10 @@ __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm
 static Scene* hst_scene = NULL;
 static GuiDataContainer* guiData = NULL;
 static glm::vec3* dev_image = NULL;
-static Geom* dev_geoms = NULL;
+static PrimitiveRef* dev_primitives = NULL;
+static Cube* dev_cubes = NULL;
+static Sphere* dev_spheres = NULL;
+static Triangle* dev_triangles = NULL;
 static BVHNode* dev_bvhNodes = NULL;
 static int* dev_bvhPrimitiveIndices = NULL;
 static Material* dev_materials = NULL;
@@ -127,6 +130,16 @@ struct DeviceTextureStore
 };
 
 static DeviceTextureStore dev_textureStore;
+
+struct DevicePrimitiveStore
+{
+    const PrimitiveRef* primitives = NULL;
+    const Cube* cubes = NULL;
+    const Sphere* spheres = NULL;
+    const Triangle* triangles = NULL;
+};
+
+static DevicePrimitiveStore dev_primitiveStore;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 static int* dev_materialSortKeys = NULL;
@@ -150,8 +163,24 @@ void pathtraceInit(Scene* scene)
 
     cudaMalloc(&dev_paths, pixelcount * sizeof(PathSegment));
 
-    cudaMalloc(&dev_geoms, scene->geoms.size() * sizeof(Geom));
-    cudaMemcpy(dev_geoms, scene->geoms.data(), scene->geoms.size() * sizeof(Geom), cudaMemcpyHostToDevice);
+    cudaMalloc(&dev_primitives, scene->primitives.size() * sizeof(PrimitiveRef));
+    cudaMemcpy(dev_primitives, scene->primitives.data(), scene->primitives.size() * sizeof(PrimitiveRef), cudaMemcpyHostToDevice);
+    if (!scene->cubes.empty())
+    {
+        cudaMalloc(&dev_cubes, scene->cubes.size() * sizeof(Cube));
+        cudaMemcpy(dev_cubes, scene->cubes.data(), scene->cubes.size() * sizeof(Cube), cudaMemcpyHostToDevice);
+    }
+    if (!scene->spheres.empty())
+    {
+        cudaMalloc(&dev_spheres, scene->spheres.size() * sizeof(Sphere));
+        cudaMemcpy(dev_spheres, scene->spheres.data(), scene->spheres.size() * sizeof(Sphere), cudaMemcpyHostToDevice);
+    }
+    if (!scene->triangles.empty())
+    {
+        cudaMalloc(&dev_triangles, scene->triangles.size() * sizeof(Triangle));
+        cudaMemcpy(dev_triangles, scene->triangles.data(), scene->triangles.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
+    }
+    dev_primitiveStore = { dev_primitives, dev_cubes, dev_spheres, dev_triangles };
 
     if (!scene->bvhNodes.empty())
     {
@@ -212,7 +241,10 @@ void pathtraceFree()
 {
     cudaFree(dev_image);  // no-op if dev_image is null
     cudaFree(dev_paths);
-    cudaFree(dev_geoms);
+    cudaFree(dev_primitives);
+    cudaFree(dev_cubes);
+    cudaFree(dev_spheres);
+    cudaFree(dev_triangles);
     cudaFree(dev_bvhNodes);
     cudaFree(dev_bvhPrimitiveIndices);
     cudaFree(dev_materials);
@@ -232,6 +264,11 @@ void pathtraceFree()
     dev_textureTexels = NULL;
     dev_textureCount = 0;
     dev_textureStore = DeviceTextureStore{};
+    dev_primitives = NULL;
+    dev_cubes = NULL;
+    dev_spheres = NULL;
+    dev_triangles = NULL;
+    dev_primitiveStore = DevicePrimitiveStore{};
 
     checkCUDAError("pathtraceFree");
 }
@@ -300,11 +337,37 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
 // computeIntersections handles generating ray intersections ONLY.
 // Generating new rays is handled in your shader(s).
 // Feel free to modify the code below.
+__device__ float intersectPrimitive(const PrimitiveRef& primitive, const DevicePrimitiveStore& primitiveStore,
+    const Ray& ray, glm::vec3& intersectionPoint, glm::vec3& normal, glm::vec2& uv, bool& outside)
+{
+    switch (primitive.type)
+    {
+    case CUBE:
+        return boxIntersectionTest(primitiveStore.cubes[primitive.index], ray, intersectionPoint, normal, outside);
+    case SPHERE:
+        return sphereIntersectionTest(primitiveStore.spheres[primitive.index], ray, intersectionPoint, normal, outside);
+    case TRIANGLE:
+        return triangleIntersectionTest(primitiveStore.triangles[primitive.index], ray, intersectionPoint, normal, uv, outside);
+    }
+    return -1.0f;
+}
+
+__device__ int primitiveMaterialId(const PrimitiveRef& primitive, const DevicePrimitiveStore& primitiveStore)
+{
+    switch (primitive.type)
+    {
+    case CUBE: return primitiveStore.cubes[primitive.index].materialid;
+    case SPHERE: return primitiveStore.spheres[primitive.index].materialid;
+    case TRIANGLE: return primitiveStore.triangles[primitive.index].materialid;
+    }
+    return -1;
+}
+
 __global__ void computeIntersections(
     int depth,
     int num_paths,
     PathSegment* pathSegments,
-    Geom* geoms,
+    DevicePrimitiveStore primitiveStore,
     const BVHNode* bvhNodes,
     int bvhNodeCount,
     const int* bvhPrimitiveIndices,
@@ -318,7 +381,7 @@ __global__ void computeIntersections(
 
         glm::vec3 normal;
         float t_min = FLT_MAX;
-        int hit_geom_index = -1;
+        int hit_primitive_index = -1;
 
         glm::vec3 tmp_intersect;
         glm::vec3 tmp_normal;
@@ -347,29 +410,19 @@ __global__ void computeIntersections(
 
             for (int primitiveOffset = 0; primitiveOffset < node.primitiveCount; ++primitiveOffset)
             {
-                const int geomIndex = bvhPrimitiveIndices[node.firstPrimitive + primitiveOffset];
-                const Geom& geom = geoms[geomIndex];
+                const int primitiveIndex = bvhPrimitiveIndices[node.firstPrimitive + primitiveOffset];
+                const PrimitiveRef& primitive = primitiveStore.primitives[primitiveIndex];
                 bool outside = true;
                 float t = -1.0f;
                 glm::vec2 candidateUV(0.0f);
 
-                if (geom.type == CUBE)
-                {
-                    t = boxIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
-                }
-                else if (geom.type == SPHERE)
-                {
-                    t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
-                }
-                else if (geom.type == TRIANGLE)
-                {
-                    t = triangleIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, candidateUV, outside);
-                }
+                t = intersectPrimitive(primitive, primitiveStore, pathSegment.ray,
+                    tmp_intersect, tmp_normal, candidateUV, outside);
 
                 if (t > 0.0f && t_min > t)
                 {
                     t_min = t;
-                    hit_geom_index = geomIndex;
+                    hit_primitive_index = primitiveIndex;
                     normal = tmp_normal;
                     hit_uv = candidateUV;
                 }
@@ -377,7 +430,7 @@ __global__ void computeIntersections(
             nodeIndex = node.escapeIndex;
         }
 
-        if (hit_geom_index == -1)
+        if (hit_primitive_index == -1)
         {
             intersections[path_index].t = -1.0f;
             intersections[path_index].primitiveIndex = -1;
@@ -386,10 +439,11 @@ __global__ void computeIntersections(
         {
             // The ray hits something
             intersections[path_index].t = t_min;
-            intersections[path_index].materialId = geoms[hit_geom_index].materialid;
+            intersections[path_index].materialId = primitiveMaterialId(
+                primitiveStore.primitives[hit_primitive_index], primitiveStore);
             intersections[path_index].surfaceNormal = normal;
             intersections[path_index].surfaceUV = hit_uv;
-            intersections[path_index].primitiveIndex = hit_geom_index;
+            intersections[path_index].primitiveIndex = hit_primitive_index;
         }
     }
 }
@@ -492,21 +546,26 @@ __device__ glm::vec3 emittedRadiance(const Material& material)
     return material.color * material.emittance;
 }
 
-__device__ glm::vec3 lightSurfaceNormal(const Geom& geom, const glm::vec3& point)
+__device__ glm::vec3 lightSurfaceNormal(const PrimitiveRef& primitive,
+    const DevicePrimitiveStore& primitiveStore, const glm::vec3& point)
 {
-    if (geom.type == TRIANGLE)
+    if (primitive.type == TRIANGLE)
     {
+        const Triangle& triangle = primitiveStore.triangles[primitive.index];
         return glm::normalize(glm::cross(
-            geom.triangleVertices[1] - geom.triangleVertices[0],
-            geom.triangleVertices[2] - geom.triangleVertices[0]));
+            triangle.triangleVertices[1] - triangle.triangleVertices[0],
+            triangle.triangleVertices[2] - triangle.triangleVertices[0]));
     }
 
-    const glm::vec3 localPoint = multiplyMV(geom.inverseTransform, glm::vec4(point, 1.0f));
-    if (geom.type == SPHERE)
+    if (primitive.type == SPHERE)
     {
-        return glm::normalize(multiplyMV(geom.invTranspose, glm::vec4(glm::normalize(localPoint), 0.0f)));
+        const Sphere& sphere = primitiveStore.spheres[primitive.index];
+        const glm::vec3 localPoint = multiplyMV(sphere.inverseTransform, glm::vec4(point, 1.0f));
+        return glm::normalize(multiplyMV(sphere.invTranspose, glm::vec4(glm::normalize(localPoint), 0.0f)));
     }
 
+    const Cube& cube = primitiveStore.cubes[primitive.index];
+    const glm::vec3 localPoint = multiplyMV(cube.inverseTransform, glm::vec4(point, 1.0f));
     glm::vec3 localNormal(0.0f);
     const glm::vec3 absolutePoint(fabsf(localPoint.x), fabsf(localPoint.y), fabsf(localPoint.z));
     if (absolutePoint.x >= absolutePoint.y && absolutePoint.x >= absolutePoint.z)
@@ -515,66 +574,74 @@ __device__ glm::vec3 lightSurfaceNormal(const Geom& geom, const glm::vec3& point
         localNormal.y = localPoint.y >= 0.0f ? 1.0f : -1.0f;
     else
         localNormal.z = localPoint.z >= 0.0f ? 1.0f : -1.0f;
-    return glm::normalize(multiplyMV(geom.invTranspose, glm::vec4(localNormal, 0.0f)));
+    return glm::normalize(multiplyMV(cube.invTranspose, glm::vec4(localNormal, 0.0f)));
 }
 
-__device__ float primitiveSurfaceAreaPdf(const Geom& geom, const glm::vec3& point)
+__device__ float primitiveSurfaceAreaPdf(const PrimitiveRef& primitive,
+    const DevicePrimitiveStore& primitiveStore, const glm::vec3& point)
 {
-    if (geom.type == TRIANGLE)
+    if (primitive.type == TRIANGLE)
     {
+        const Triangle& triangle = primitiveStore.triangles[primitive.index];
         const float area = 0.5f * glm::length(glm::cross(
-            geom.triangleVertices[1] - geom.triangleVertices[0],
-            geom.triangleVertices[2] - geom.triangleVertices[0]));
+            triangle.triangleVertices[1] - triangle.triangleVertices[0],
+            triangle.triangleVertices[2] - triangle.triangleVertices[0]));
         return area > EPSILON ? 1.0f / area : 0.0f;
     }
 
-    if (geom.type == SPHERE)
+    if (primitive.type == SPHERE)
     {
-        const glm::vec3 localPoint = multiplyMV(geom.inverseTransform, glm::vec4(point, 1.0f));
+        const Sphere& sphere = primitiveStore.spheres[primitive.index];
+        const glm::vec3 localPoint = multiplyMV(sphere.inverseTransform, glm::vec4(point, 1.0f));
         if (glm::length2(localPoint) <= EPSILON) return 0.0f;
         const glm::vec3 localNormal = glm::normalize(localPoint);
-        const float jacobian = fabsf(glm::determinant(glm::mat3(geom.transform))) *
-            glm::length(multiplyMV(geom.invTranspose, glm::vec4(localNormal, 0.0f)));
+        const float jacobian = fabsf(glm::determinant(glm::mat3(sphere.transform))) *
+            glm::length(multiplyMV(sphere.invTranspose, glm::vec4(localNormal, 0.0f)));
         // The unit-local sphere has radius 0.5, and therefore area PI.
         return jacobian > EPSILON ? 1.0f / (PI * jacobian) : 0.0f;
     }
 
-    const glm::vec3 xAxis = multiplyMV(geom.transform, glm::vec4(1, 0, 0, 0));
-    const glm::vec3 yAxis = multiplyMV(geom.transform, glm::vec4(0, 1, 0, 0));
-    const glm::vec3 zAxis = multiplyMV(geom.transform, glm::vec4(0, 0, 1, 0));
+    const Cube& cube = primitiveStore.cubes[primitive.index];
+    const glm::vec3 xAxis = multiplyMV(cube.transform, glm::vec4(1, 0, 0, 0));
+    const glm::vec3 yAxis = multiplyMV(cube.transform, glm::vec4(0, 1, 0, 0));
+    const glm::vec3 zAxis = multiplyMV(cube.transform, glm::vec4(0, 0, 1, 0));
     const float area = 2.0f * (glm::length(glm::cross(yAxis, zAxis)) +
         glm::length(glm::cross(xAxis, zAxis)) + glm::length(glm::cross(xAxis, yAxis)));
     return area > EPSILON ? 1.0f / area : 0.0f;
 }
 
-__device__ LightSurfaceSample sampleLightSurface(const Geom& geom, thrust::default_random_engine& rng)
+__device__ LightSurfaceSample sampleLightSurface(const PrimitiveRef& primitive,
+    const DevicePrimitiveStore& primitiveStore, thrust::default_random_engine& rng)
 {
     LightSurfaceSample sample{};
     sample.valid = false;
     thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
 
-    if (geom.type == TRIANGLE)
+    if (primitive.type == TRIANGLE)
     {
+        const Triangle& triangle = primitiveStore.triangles[primitive.index];
         const float rootU = sqrtf(u01(rng));
         const float v = u01(rng);
-        sample.position = (1.0f - rootU) * geom.triangleVertices[0] +
-            rootU * (1.0f - v) * geom.triangleVertices[1] + rootU * v * geom.triangleVertices[2];
-        sample.normal = lightSurfaceNormal(geom, sample.position);
+        sample.position = (1.0f - rootU) * triangle.triangleVertices[0] +
+            rootU * (1.0f - v) * triangle.triangleVertices[1] + rootU * v * triangle.triangleVertices[2];
+        sample.normal = lightSurfaceNormal(primitive, primitiveStore, sample.position);
     }
-    else if (geom.type == SPHERE)
+    else if (primitive.type == SPHERE)
     {
+        const Sphere& sphere = primitiveStore.spheres[primitive.index];
         const float z = 1.0f - 2.0f * u01(rng);
         const float radial = sqrtf(fmaxf(0.0f, 1.0f - z * z));
         const float phi = TWO_PI * u01(rng);
         const glm::vec3 localNormal(radial * cosf(phi), radial * sinf(phi), z);
-        sample.position = multiplyMV(geom.transform, glm::vec4(0.5f * localNormal, 1.0f));
-        sample.normal = glm::normalize(multiplyMV(geom.invTranspose, glm::vec4(localNormal, 0.0f)));
+        sample.position = multiplyMV(sphere.transform, glm::vec4(0.5f * localNormal, 1.0f));
+        sample.normal = glm::normalize(multiplyMV(sphere.invTranspose, glm::vec4(localNormal, 0.0f)));
     }
     else
     {
-        const glm::vec3 xAxis = multiplyMV(geom.transform, glm::vec4(1, 0, 0, 0));
-        const glm::vec3 yAxis = multiplyMV(geom.transform, glm::vec4(0, 1, 0, 0));
-        const glm::vec3 zAxis = multiplyMV(geom.transform, glm::vec4(0, 0, 1, 0));
+        const Cube& cube = primitiveStore.cubes[primitive.index];
+        const glm::vec3 xAxis = multiplyMV(cube.transform, glm::vec4(1, 0, 0, 0));
+        const glm::vec3 yAxis = multiplyMV(cube.transform, glm::vec4(0, 1, 0, 0));
+        const glm::vec3 zAxis = multiplyMV(cube.transform, glm::vec4(0, 0, 1, 0));
         const float faceAreas[3] = { glm::length(glm::cross(yAxis, zAxis)),
             glm::length(glm::cross(xAxis, zAxis)), glm::length(glm::cross(xAxis, yAxis)) };
         const float totalArea = 2.0f * (faceAreas[0] + faceAreas[1] + faceAreas[2]);
@@ -595,26 +662,26 @@ __device__ LightSurfaceSample sampleLightSurface(const Geom& geom, thrust::defau
         }
         glm::vec3 localPoint(u01(rng) - 0.5f, u01(rng) - 0.5f, u01(rng) - 0.5f);
         localPoint[axis] = 0.5f * static_cast<float>(sign);
-        sample.position = multiplyMV(geom.transform, glm::vec4(localPoint, 1.0f));
+        sample.position = multiplyMV(cube.transform, glm::vec4(localPoint, 1.0f));
         glm::vec3 localNormal(0.0f);
         localNormal[axis] = static_cast<float>(sign);
-        sample.normal = glm::normalize(multiplyMV(geom.invTranspose, glm::vec4(localNormal, 0.0f)));
+        sample.normal = glm::normalize(multiplyMV(cube.invTranspose, glm::vec4(localNormal, 0.0f)));
     }
 
-    sample.pdfArea = primitiveSurfaceAreaPdf(geom, sample.position);
+    sample.pdfArea = primitiveSurfaceAreaPdf(primitive, primitiveStore, sample.position);
     sample.valid = sample.pdfArea > 0.0f;
     return sample;
 }
 
-__device__ float lightPdfSolidAngle(const Geom& light, const glm::vec3& referencePoint,
-    const glm::vec3& lightPoint, const glm::vec3& lightNormal, int lightCount)
+__device__ float lightPdfSolidAngle(const PrimitiveRef& light, const DevicePrimitiveStore& primitiveStore,
+    const glm::vec3& referencePoint, const glm::vec3& lightPoint, const glm::vec3& lightNormal, int lightCount)
 {
     if (lightCount <= 0) return 0.0f;
     const glm::vec3 toLight = lightPoint - referencePoint;
     const float distance2 = glm::dot(toLight, toLight);
     if (distance2 <= EPSILON) return 0.0f;
     const float lightCosine = glm::dot(lightNormal, -glm::normalize(toLight));
-    const float areaPdf = primitiveSurfaceAreaPdf(light, lightPoint);
+    const float areaPdf = primitiveSurfaceAreaPdf(light, primitiveStore, lightPoint);
     return lightCosine > EPSILON ? distance2 * areaPdf /
         (lightCosine * static_cast<float>(lightCount)) : 0.0f;
 }
@@ -686,7 +753,7 @@ __device__ EnvironmentSample sampleEnvironment(const DeviceEnvironmentMap& envir
     return sample;
 }
 
-__device__ bool isOccluded(const Ray& ray, float maxDistance, const Geom* geoms,
+__device__ bool isOccluded(const Ray& ray, float maxDistance, const DevicePrimitiveStore& primitiveStore,
     const BVHNode* bvhNodes, int bvhNodeCount, const int* bvhPrimitiveIndices)
 {
     int nodeIndex = 0;
@@ -706,13 +773,13 @@ __device__ bool isOccluded(const Ray& ray, float maxDistance, const Geom* geoms,
         }
         for (int offset = 0; offset < node.primitiveCount; ++offset)
         {
-            const Geom& geom = geoms[bvhPrimitiveIndices[node.firstPrimitive + offset]];
+            const PrimitiveRef& primitive = primitiveStore.primitives[
+                bvhPrimitiveIndices[node.firstPrimitive + offset]];
             glm::vec3 ignoredPoint, ignoredNormal;
             glm::vec2 ignoredUV;
             bool outside;
-            float t = geom.type == CUBE ? boxIntersectionTest(geom, ray, ignoredPoint, ignoredNormal, outside) :
-                (geom.type == SPHERE ? sphereIntersectionTest(geom, ray, ignoredPoint, ignoredNormal, outside) :
-                triangleIntersectionTest(geom, ray, ignoredPoint, ignoredNormal, ignoredUV, outside));
+            const float t = intersectPrimitive(primitive, primitiveStore, ray,
+                ignoredPoint, ignoredNormal, ignoredUV, outside);
             if (t > 1e-4f && t < maxDistance) return true;
         }
         nodeIndex = node.escapeIndex;
@@ -799,7 +866,7 @@ __device__ glm::vec3 sampleBaseColorTexture(const Material& material, const glm:
     return glm::vec3(srgbToLinear(srgb.x), srgbToLinear(srgb.y), srgbToLinear(srgb.z));
 }
 
-__device__ glm::vec3 sampleNormalTexture(const Material& material, const Geom& triangle,
+__device__ glm::vec3 sampleNormalTexture(const Material& material, const Triangle& triangle,
     const glm::vec2& uv, glm::vec3 geometricNormal, const DeviceTextureStore& textureStore)
 {
     if (!textureStore.validTextureIndex(material.normalTexture) || !triangle.hasTextureCoordinates)
@@ -902,7 +969,7 @@ __device__ float bsdfPdf(const Material& material, const glm::vec3& incoming,
 }
 
 __device__ glm::vec3 estimateDirectLighting(const Material& material, const PathSegment& pathSegment,
-    const glm::vec3& intersectionPoint, const glm::vec3& normal, const Geom* geoms,
+    const glm::vec3& intersectionPoint, const glm::vec3& normal, const DevicePrimitiveStore& primitiveStore,
     const Material* materials, const int* lightPrimitives, int emissiveLightCount,
     const DeviceEnvironmentMap& environment, int totalLightCount, const BVHNode* bvhNodes,
     int bvhNodeCount, const int* bvhPrimitiveIndices, thrust::default_random_engine& rng)
@@ -919,7 +986,7 @@ __device__ glm::vec3 estimateDirectLighting(const Material& material, const Path
         const float cosSurface = fmaxf(0.0f, glm::dot(offsetNormal, sample.direction));
         if (cosSurface <= 0.0f) return glm::vec3(0.0f);
         const Ray shadowRay{ intersectionPoint + 0.001f * offsetNormal, sample.direction };
-        if (isOccluded(shadowRay, FLT_MAX, geoms, bvhNodes, bvhNodeCount, bvhPrimitiveIndices))
+        if (isOccluded(shadowRay, FLT_MAX, primitiveStore, bvhNodes, bvhNodeCount, bvhPrimitiveIndices))
             return glm::vec3(0.0f);
         const float lightPdf = sample.pdfSolidAngle / static_cast<float>(totalLightCount);
         const float scatteringPdf = bsdfPdf(material, pathSegment.ray.direction, sample.direction, normal);
@@ -933,8 +1000,8 @@ __device__ glm::vec3 estimateDirectLighting(const Material& material, const Path
     // The only non-geometry entry is the environment entry immediately after
     // the emissive primitives, so a valid selection below is always a surface.
     if (chosenLight >= emissiveLightCount) return glm::vec3(0.0f);
-    const Geom& light = geoms[lightPrimitives[chosenLight]];
-    const LightSurfaceSample sample = sampleLightSurface(light, rng);
+    const PrimitiveRef& light = primitiveStore.primitives[lightPrimitives[chosenLight]];
+    const LightSurfaceSample sample = sampleLightSurface(light, primitiveStore, rng);
     if (!sample.valid) return glm::vec3(0.0f);
 
     const glm::vec3 shadowOrigin = intersectionPoint + 0.001f * offsetNormal;
@@ -950,7 +1017,7 @@ __device__ glm::vec3 estimateDirectLighting(const Material& material, const Path
     if (cosSurface <= 0.0f || cosLight <= EPSILON) return glm::vec3(0.0f);
 
     Ray shadowRay{ shadowOrigin, wi };
-    if (isOccluded(shadowRay, distance - 0.001f, geoms, bvhNodes, bvhNodeCount, bvhPrimitiveIndices))
+    if (isOccluded(shadowRay, distance - 0.001f, primitiveStore, bvhNodes, bvhNodeCount, bvhPrimitiveIndices))
         return glm::vec3(0.0f);
 
     const float lightPdf = distance2 * sample.pdfArea /
@@ -959,7 +1026,7 @@ __device__ glm::vec3 estimateDirectLighting(const Material& material, const Path
     if (lightPdf <= EPSILON) return glm::vec3(0.0f);
     const float lightPdf2 = lightPdf * lightPdf;
     const float misWeight = lightPdf2 / (lightPdf2 + scatteringPdf * scatteringPdf);
-    const Material& lightMaterial = materials[light.materialid];
+    const Material& lightMaterial = materials[primitiveMaterialId(light, primitiveStore)];
     return evaluateDirectBSDF(material, pathSegment.ray.direction, wi, normal) *
         emittedRadiance(lightMaterial) * (cosSurface * misWeight / lightPdf);
 }
@@ -971,7 +1038,7 @@ __global__ void shadeBSDF(
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
     Material* materials,
-    const Geom* geoms,
+    DevicePrimitiveStore primitiveStore,
     const int* lightPrimitives,
     int emissiveLightCount,
     DeviceEnvironmentMap environment,
@@ -989,8 +1056,9 @@ __global__ void shadeBSDF(
         {
             Material material = materials[intersection.materialId];
             PathSegment pathSegment = pathSegments[idx];
-            const Geom& hitGeom = geoms[intersection.primitiveIndex];
-            if (hitGeom.type == TRIANGLE && hitGeom.hasTextureCoordinates)
+            const PrimitiveRef& hitPrimitive = primitiveStore.primitives[intersection.primitiveIndex];
+            if (hitPrimitive.type == TRIANGLE &&
+                primitiveStore.triangles[hitPrimitive.index].hasTextureCoordinates)
             {
                 material.color *= sampleBaseColorTexture(material, intersection.surfaceUV, textureStore);
             }
@@ -1001,8 +1069,7 @@ __global__ void shadeBSDF(
             }
             if (material.type == MATERIAL_EMISSIVE || fmaxf(emission.x, fmaxf(emission.y, emission.z)) > 0.0f) {
                 const glm::vec3 lightPoint = pathSegment.ray.origin + intersection.t * pathSegment.ray.direction;
-                const Geom& hitLight = hitGeom;
-                const glm::vec3 hitLightNormal = lightSurfaceNormal(hitLight, lightPoint);
+                const glm::vec3 hitLightNormal = lightSurfaceNormal(hitPrimitive, primitiveStore, lightPoint);
                 const bool frontFacing = glm::dot(hitLightNormal,
                     -glm::normalize(pathSegment.ray.direction)) > EPSILON;
                 if (frontFacing)
@@ -1010,8 +1077,8 @@ __global__ void shadeBSDF(
                     float misWeight = 1.0f;
                     if (!pathSegment.previousBounceWasSpecular && pathSegment.previousBsdfPdf > 0.0f)
                     {
-                        const float lightPdf = lightPdfSolidAngle(hitLight, pathSegment.ray.origin,
-                            lightPoint, hitLightNormal, lightCount);
+                        const float lightPdf = lightPdfSolidAngle(hitPrimitive, primitiveStore,
+                            pathSegment.ray.origin, lightPoint, hitLightNormal, lightCount);
                         const float bsdfPdf2 = pathSegment.previousBsdfPdf * pathSegment.previousBsdfPdf;
                         misWeight = bsdfPdf2 / (bsdfPdf2 + lightPdf * lightPdf);
                     }
@@ -1022,9 +1089,10 @@ __global__ void shadeBSDF(
             else {
                 glm::vec3 incoming = glm::normalize(pathSegment.ray.direction);
                 glm::vec3 geometricNormal = glm::normalize(intersection.surfaceNormal);
-                if (hitGeom.type == TRIANGLE && hitGeom.hasTextureCoordinates)
+                if (hitPrimitive.type == TRIANGLE &&
+                    primitiveStore.triangles[hitPrimitive.index].hasTextureCoordinates)
                 {
-                    geometricNormal = sampleNormalTexture(material, hitGeom, intersection.surfaceUV,
+                    geometricNormal = sampleNormalTexture(material, primitiveStore.triangles[hitPrimitive.index], intersection.surfaceUV,
                         geometricNormal, textureStore);
                 }
                 bool enteringDielectric = glm::dot(incoming, geometricNormal) < 0.0f;
@@ -1044,7 +1112,7 @@ __global__ void shadeBSDF(
                 if (material.type != MATERIAL_MIRROR && material.type != MATERIAL_DIELECTRIC)
                 {
                     pathSegment.radiance += pathSegment.color * estimateDirectLighting(material,
-                        pathSegment, intersect, normal, geoms, materials, lightPrimitives, emissiveLightCount,
+                        pathSegment, intersect, normal, primitiveStore, materials, lightPrimitives, emissiveLightCount,
                         environment, lightCount,
                         bvhNodes, bvhNodeCount, bvhPrimitiveIndices, rng);
                 }
@@ -1304,7 +1372,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             depth,
             num_paths,
             dev_paths,
-            dev_geoms,
+            dev_primitiveStore,
             dev_bvhNodes,
             static_cast<int>(hst_scene->bvhNodes.size()),
             dev_bvhPrimitiveIndices,
@@ -1349,7 +1417,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_intersections,
             dev_paths,
             dev_materials,
-            dev_geoms,
+            dev_primitiveStore,
             dev_lightPrimitives,
             dev_lightPrimitiveCount,
             dev_environment,

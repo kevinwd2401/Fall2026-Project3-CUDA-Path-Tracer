@@ -67,26 +67,59 @@ struct BVHBin
     int count = 0;
 };
 
-Bounds boundsForGeom(const Geom& geom)
+Bounds boundsForCube(const Cube& cube)
 {
     Bounds bounds;
-    if (geom.type == TRIANGLE)
-    {
-        bounds.grow(geom.triangleVertices[0]);
-        bounds.grow(geom.triangleVertices[1]);
-        bounds.grow(geom.triangleVertices[2]);
-        return bounds;
-    }
-
     for (int corner = 0; corner < 8; ++corner)
     {
         const glm::vec3 local(
             (corner & 1) ? 0.5f : -0.5f,
             (corner & 2) ? 0.5f : -0.5f,
             (corner & 4) ? 0.5f : -0.5f);
-        bounds.grow(glm::vec3(geom.transform * glm::vec4(local, 1.0f)));
+        bounds.grow(glm::vec3(cube.transform * glm::vec4(local, 1.0f)));
     }
     return bounds;
+}
+
+Bounds boundsForSphere(const Sphere& sphere)
+{
+    // A transformed sphere fits within the transformed unit-cube bounds.
+    Cube cube{};
+    cube.transform = sphere.transform;
+    return boundsForCube(cube);
+}
+
+Bounds boundsForTriangle(const Triangle& triangle)
+{
+    Bounds bounds;
+    bounds.grow(triangle.triangleVertices[0]);
+    bounds.grow(triangle.triangleVertices[1]);
+    bounds.grow(triangle.triangleVertices[2]);
+    return bounds;
+}
+
+Bounds boundsForPrimitive(const PrimitiveRef& primitive, const std::vector<Cube>& cubes,
+    const std::vector<Sphere>& spheres, const std::vector<Triangle>& triangles)
+{
+    switch (primitive.type)
+    {
+    case CUBE: return boundsForCube(cubes[primitive.index]);
+    case SPHERE: return boundsForSphere(spheres[primitive.index]);
+    case TRIANGLE: return boundsForTriangle(triangles[primitive.index]);
+    }
+    return Bounds{};
+}
+
+int materialForPrimitive(const PrimitiveRef& primitive, const std::vector<Cube>& cubes,
+    const std::vector<Sphere>& spheres, const std::vector<Triangle>& triangles)
+{
+    switch (primitive.type)
+    {
+    case CUBE: return cubes[primitive.index].materialid;
+    case SPHERE: return spheres[primitive.index].materialid;
+    case TRIANGLE: return triangles[primitive.index].materialid;
+    }
+    return -1;
 }
 
 MaterialType parseMaterialType(const std::string& type)
@@ -379,9 +412,9 @@ void Scene::loadEnvironmentMap(const string& filename)
 void Scene::rebuildEmissivePrimitives()
 {
     emissivePrimitives.clear();
-    for (size_t i = 0; i < geoms.size(); ++i)
+    for (size_t i = 0; i < primitives.size(); ++i)
     {
-        const int materialID = geoms[i].materialid;
+        const int materialID = materialForPrimitive(primitives[i], cubes, spheres, triangles);
         if (materialID >= 0 && materialID < static_cast<int>(materials.size()) && materialEmits(materials[materialID])) emissivePrimitives.push_back(static_cast<int>(i));
     }
 }
@@ -389,18 +422,18 @@ void Scene::rebuildEmissivePrimitives()
 void Scene::buildBVH()
 {
     bvhNodes.clear();
-    bvhPrimitiveIndices.resize(geoms.size());
-    for (size_t i = 0; i < geoms.size(); ++i)
+    bvhPrimitiveIndices.resize(primitives.size());
+    for (size_t i = 0; i < primitives.size(); ++i)
     {
         bvhPrimitiveIndices[i] = static_cast<int>(i);
     }
-    if (geoms.empty()) return;
+    if (primitives.empty()) return;
 
-    std::vector<Bounds> primitiveBounds(geoms.size());
-    std::vector<glm::vec3> primitiveCentroids(geoms.size());
-    for (size_t i = 0; i < geoms.size(); ++i)
+    std::vector<Bounds> primitiveBounds(primitives.size());
+    std::vector<glm::vec3> primitiveCentroids(primitives.size());
+    for (size_t i = 0; i < primitives.size(); ++i)
     {
-        primitiveBounds[i] = boundsForGeom(geoms[i]);
+        primitiveBounds[i] = boundsForPrimitive(primitives[i], cubes, spheres, triangles);
         primitiveCentroids[i] = 0.5f * (primitiveBounds[i].minimum + primitiveBounds[i].maximum);
     }
 
@@ -544,13 +577,13 @@ void Scene::buildBVH()
     };
 
     buildNode(0, static_cast<int>(bvhPrimitiveIndices.size()));
-    cout << "Built SAH BVH with " << bvhNodes.size() << " nodes for " << geoms.size() << " primitives." << endl;
+    cout << "Built SAH BVH with " << bvhNodes.size() << " nodes for " << primitives.size() << " primitives." << endl;
 
 
     // debugging statements.
     int leafCount = 0;
     int internalCount = 0;
-    int minimumLeafSize = static_cast<int>(geoms.size());
+    int minimumLeafSize = static_cast<int>(primitives.size());
     int maximumLeafSize = 0;
     int totalLeafPrimitives = 0;
     for (const BVHNode& node : bvhNodes)
@@ -586,7 +619,7 @@ void Scene::buildBVH()
         const int leftChild = nodeIndex + 1;
         const int rightChild = bvhNodes[leftChild].escapeIndex;
         const float nodeArea = Bounds{ node.boundsMin, node.boundsMax }.surfaceArea();
-        if (nodeArea <= 0.0f) return static_cast<float>(geoms.size());
+        if (nodeArea <= 0.0f) return static_cast<float>(primitives.size());
         const float leftArea = Bounds{ bvhNodes[leftChild].boundsMin, bvhNodes[leftChild].boundsMax }.surfaceArea();
         const float rightArea = Bounds{ bvhNodes[rightChild].boundsMin, bvhNodes[rightChild].boundsMax }.surfaceArea();
         return 1.0f + (leftArea / nodeArea) * estimateSAHCost(leftChild) +
@@ -601,7 +634,7 @@ void Scene::buildBVH()
          << ") max(" << rootBounds.maximum.x << ", " << rootBounds.maximum.y << ", " << rootBounds.maximum.z
          << "), surface area: " << rootArea << endl;
     cout << "  estimated SAH traversal cost: " << estimateSAHCost(0)
-         << " (linear baseline: " << geoms.size() << " primitive tests)" << endl;
+         << " (linear baseline: " << primitives.size() << " primitive tests)" << endl;
 }
 
 void Scene::loadFromJSON(const std::string& jsonName)
@@ -627,15 +660,31 @@ void Scene::loadFromJSON(const std::string& jsonName)
     }
     for (const json& p : data["Objects"])
     {
-        Geom geometry{};
-        geometry.type = p["TYPE"] == "cube" ? CUBE : SPHERE;
-        geometry.materialid = materialNames.at(p["MATERIAL"]);
+        const GeomType type = p["TYPE"] == "cube" ? CUBE : SPHERE;
+        const int materialid = materialNames.at(p["MATERIAL"]);
         const auto& t = p["TRANS"]; const auto& r = p["ROTAT"]; const auto& s = p["SCALE"];
-        geometry.translation = glm::vec3(t[0], t[1], t[2]); geometry.rotation = glm::vec3(r[0], r[1], r[2]); geometry.scale = glm::vec3(s[0], s[1], s[2]);
-        geometry.transform = utilityCore::buildTransformationMatrix(geometry.translation, geometry.rotation, geometry.scale);
-        geometry.inverseTransform = glm::inverse(geometry.transform);
-        geometry.invTranspose = glm::inverseTranspose(geometry.transform);
-        geoms.push_back(geometry);
+        const glm::mat4 transform = utilityCore::buildTransformationMatrix(
+            glm::vec3(t[0], t[1], t[2]), glm::vec3(r[0], r[1], r[2]), glm::vec3(s[0], s[1], s[2]));
+        if (type == CUBE)
+        {
+            Cube cube{};
+            cube.materialid = materialid;
+            cube.transform = transform;
+            cube.inverseTransform = glm::inverse(transform);
+            cube.invTranspose = glm::inverseTranspose(transform);
+            primitives.push_back({ CUBE, static_cast<int>(cubes.size()) });
+            cubes.push_back(cube);
+        }
+        else
+        {
+            Sphere sphere{};
+            sphere.materialid = materialid;
+            sphere.transform = transform;
+            sphere.inverseTransform = glm::inverse(transform);
+            sphere.invTranspose = glm::inverseTranspose(transform);
+            primitives.push_back({ SPHERE, static_cast<int>(spheres.size()) });
+            spheres.push_back(sphere);
+        }
     }
     const json& c = data["Camera"];
     Camera& camera = state.camera;
@@ -890,12 +939,12 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         const json meshes = document.value("meshes", json::array());
         auto importMesh = [&](int meshIndex, const glm::mat4& world) {
             if (meshIndex < 0 || meshIndex >= static_cast<int>(meshes.size())) throw runtime_error("node mesh index out of range");
-            const json primitives = meshes.at(meshIndex).value("primitives", json::array());
-            for (size_t primitiveIndex = 0; primitiveIndex < primitives.size(); ++primitiveIndex)
+            const json meshPrimitives = meshes.at(meshIndex).value("primitives", json::array());
+            for (size_t primitiveIndex = 0; primitiveIndex < meshPrimitives.size(); ++primitiveIndex)
             {
                 try
                 {
-                    const json& primitive = primitives.at(primitiveIndex);
+                    const json& primitive = meshPrimitives.at(primitiveIndex);
                     if (primitive.value("mode", GLTF_MODE_TRIANGLES) != GLTF_MODE_TRIANGLES) { cerr << "Warning: skipping non-triangle glTF primitive" << endl; continue; }
                     const json& attributes = primitive.at("attributes");
                     if (!attributes.contains("POSITION")) throw runtime_error("primitive has no POSITION");
@@ -919,8 +968,7 @@ void Scene::loadFromGLTF(const std::string& gltfName)
                     const glm::mat3 normalMatrix = hasNormals ? glm::transpose(glm::inverse(glm::mat3(world))) : glm::mat3(1.0f);
                     for (size_t i = 0; i < indices.size(); i += 3)
                     {
-                        Geom triangle{}; triangle.type = TRIANGLE; triangle.materialid = materialID;
-                        triangle.transform = triangle.inverseTransform = triangle.invTranspose = glm::mat4(1.0f);
+                        Triangle triangle{}; triangle.materialid = materialID;
                         triangle.hasVertexNormals = hasNormals ? 1 : 0;
                         triangle.hasTextureCoordinates = hasTextureCoordinates ? 1 : 0;
                         for (int vertex = 0; vertex < 3; ++vertex)
@@ -932,7 +980,8 @@ void Scene::loadFromGLTF(const std::string& gltfName)
                             if (!hasBounds) { boundsMin = boundsMax = triangle.triangleVertices[vertex]; hasBounds = true; }
                             else { boundsMin = glm::min(boundsMin, triangle.triangleVertices[vertex]); boundsMax = glm::max(boundsMax, triangle.triangleVertices[vertex]); }
                         }
-                        geoms.push_back(triangle);
+                        primitives.push_back({ TRIANGLE, static_cast<int>(triangles.size()) });
+                        triangles.push_back(triangle);
                     }
                 }
                 catch (const exception& error) { cerr << "Warning: skipping glTF primitive " << primitiveIndex << " in mesh " << meshIndex << ": " << error.what() << endl; }
@@ -959,7 +1008,7 @@ void Scene::loadFromGLTF(const std::string& gltfName)
             for (size_t i = 0; i < child.size(); ++i) if (!child[i]) roots.push_back(static_cast<int>(i));
         }
         for (int root : roots) visitNode(root, glm::mat4(1.0f));
-        if (geoms.empty()) throw runtime_error("scene contains no supported triangle geometry");
+        if (primitives.empty()) throw runtime_error("scene contains no supported triangle geometry");
 
         Camera& camera = state.camera; camera.resolution = glm::ivec2(800, 800); state.iterations = 1000; state.traceDepth = 8; state.imageName = inputPath.stem().string();
         float yscaled = tan(45.0f * PI / 180.0f);

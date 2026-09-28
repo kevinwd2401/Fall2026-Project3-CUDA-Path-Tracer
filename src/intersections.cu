@@ -1,7 +1,7 @@
 #include "intersections.h"
 
 __host__ __device__ float boxIntersectionTest(
-    Geom box,
+    Cube box,
     Ray r,
     glm::vec3 &intersectionPoint,
     glm::vec3 &normal,
@@ -57,7 +57,7 @@ __host__ __device__ float boxIntersectionTest(
 }
 
 __host__ __device__ float sphereIntersectionTest(
-    Geom sphere,
+    Sphere sphere,
     Ray r,
     glm::vec3 &intersectionPoint,
     glm::vec3 &normal,
@@ -109,7 +109,7 @@ __host__ __device__ float sphereIntersectionTest(
 }
 
 __host__ __device__ float triangleIntersectionTest(
-    Geom triangle,
+    Triangle triangle,
     Ray r,
     glm::vec3& intersectionPoint,
     glm::vec3& normal,

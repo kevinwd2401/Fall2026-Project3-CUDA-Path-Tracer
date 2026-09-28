@@ -14,7 +14,12 @@ private:
 public:
     Scene(std::string filename, std::string environmentFilename = "");
 
-    std::vector<Geom> geoms;
+    // Scene-wide primitive ordering.  Other per-primitive structures store
+    // indices into this array; the ref selects an entry in a typed list.
+    std::vector<PrimitiveRef> primitives;
+    std::vector<Cube> cubes;
+    std::vector<Sphere> spheres;
+    std::vector<Triangle> triangles;
     std::vector<BVHNode> bvhNodes;
     std::vector<int> bvhPrimitiveIndices;
     std::vector<Material> materials;
