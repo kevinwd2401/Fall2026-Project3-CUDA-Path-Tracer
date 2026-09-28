@@ -27,21 +27,23 @@ public:
     // glTF texture descriptors and their RGBA texels.
     std::vector<TextureInfo> textures;
     std::vector<glm::vec4> textureTexels;
-    // An equirectangular, linear HDR image and the precomputed probability
-    // distribution used to sample it as a directional light.
+    // An equirectangular, linear HDR image, its directional PDF, and an
+    // O(1) alias table used to importance-sample its texels on the device.
     struct EnvironmentMap
     {
         int width = 0;
         int height = 0;
         std::vector<glm::vec3> texels;
-        std::vector<float> cdf;
+        std::vector<float> aliasProbability;
+        std::vector<int> aliasIndex;
         std::vector<float> pdfSolidAngle;
 
         bool valid() const
         {
             return width > 0 && height > 0 &&
                 texels.size() == static_cast<size_t>(width) * height &&
-                cdf.size() == texels.size() && pdfSolidAngle.size() == texels.size();
+                aliasProbability.size() == texels.size() &&
+                aliasIndex.size() == texels.size() && pdfSolidAngle.size() == texels.size();
         }
     } environment;
     RenderState state;

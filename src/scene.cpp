@@ -346,7 +346,8 @@ void Scene::loadEnvironmentMap(const string& filename)
     environment.height = height;
     const size_t pixelCount = static_cast<size_t>(width) * height;
     environment.texels.resize(pixelCount);
-    environment.cdf.resize(pixelCount);
+    environment.aliasProbability.resize(pixelCount);
+    environment.aliasIndex.resize(pixelCount);
     environment.pdfSolidAngle.resize(pixelCount);
 
     // Each texel represents a different solid angle in latitude-longitude
@@ -392,11 +393,8 @@ void Scene::loadEnvironmentMap(const string& filename)
         }
     }
 
-    double cumulativeWeight = 0.0;
     for (size_t index = 0; index < pixelCount; ++index)
     {
-        cumulativeWeight += weights[index];
-        environment.cdf[index] = static_cast<float>(cumulativeWeight / totalWeight);
         const int y = static_cast<int>(index / width);
         const float theta0 = PI * static_cast<float>(y) / static_cast<float>(height);
         const float theta1 = PI * static_cast<float>(y + 1) / static_cast<float>(height);
@@ -404,7 +402,43 @@ void Scene::loadEnvironmentMap(const string& filename)
         environment.pdfSolidAngle[index] = texelSolidAngle > 0.0f ?
             weights[index] / static_cast<float>(totalWeight) / texelSolidAngle : 0.0f;
     }
-    environment.cdf.back() = 1.0f;
+
+    // Walker's alias method stores one primary texel and one fallback texel
+    // per table entry.  It exactly represents the normalized texel weights
+    // while allowing O(1) sampling in the CUDA kernel.
+    vector<float> scaledProbability(pixelCount);
+    vector<size_t> small;
+    vector<size_t> large;
+    small.reserve(pixelCount);
+    large.reserve(pixelCount);
+    for (size_t index = 0; index < pixelCount; ++index)
+    {
+        scaledProbability[index] = static_cast<float>(weights[index] * pixelCount / totalWeight);
+        if (scaledProbability[index] < 1.0f) small.push_back(index);
+        else large.push_back(index);
+    }
+    while (!small.empty() && !large.empty())
+    {
+        const size_t low = small.back();
+        small.pop_back();
+        const size_t high = large.back();
+        large.pop_back();
+        environment.aliasProbability[low] = scaledProbability[low];
+        environment.aliasIndex[low] = static_cast<int>(high);
+        scaledProbability[high] = scaledProbability[high] + scaledProbability[low] - 1.0f;
+        if (scaledProbability[high] < 1.0f) small.push_back(high);
+        else large.push_back(high);
+    }
+    for (size_t index : small)
+    {
+        environment.aliasProbability[index] = 1.0f;
+        environment.aliasIndex[index] = static_cast<int>(index);
+    }
+    for (size_t index : large)
+    {
+        environment.aliasProbability[index] = 1.0f;
+        environment.aliasIndex[index] = static_cast<int>(index);
+    }
     cout << "Loaded HDRI environment map " << filename << " (" << width << "x" << height
          << ", importance sampled)." << endl;
 }
@@ -1010,7 +1044,7 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         for (int root : roots) visitNode(root, glm::mat4(1.0f));
         if (primitives.empty()) throw runtime_error("scene contains no supported triangle geometry");
 
-        Camera& camera = state.camera; camera.resolution = glm::ivec2(800, 800); state.iterations = 1000; state.traceDepth = 8; state.imageName = inputPath.stem().string();
+        Camera& camera = state.camera; camera.resolution = glm::ivec2(800, 800); state.iterations = 6000; state.traceDepth = 8; state.imageName = inputPath.stem().string();
         float yscaled = tan(45.0f * PI / 180.0f);
         const json cameras = document.value("cameras", json::array());
         if (cameraIndex >= 0 && cameraIndex < static_cast<int>(cameras.size()) && cameras.at(cameraIndex).value("type", "") == "perspective")

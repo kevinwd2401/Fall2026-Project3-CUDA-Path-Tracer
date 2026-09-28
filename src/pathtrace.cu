@@ -19,7 +19,7 @@
 #include "interactions.h"
 #include "tonemapping.h"
 
-#define MATERIAL_SORT 0
+#define MATERIAL_SORT 1
 #define RUSSIAN_ROULETTE 1
 #define RUSSIAN_ROULETTE_START_DEPTH 3
 #define DEPTH_OF_FIELD 1
@@ -95,7 +95,8 @@ static Material* dev_materials = NULL;
 static int* dev_lightPrimitives = NULL;
 static int dev_lightPrimitiveCount = 0;
 static glm::vec3* dev_environmentTexels = NULL;
-static float* dev_environmentCdf = NULL;
+static float* dev_environmentAliasProbability = NULL;
+static int* dev_environmentAliasIndex = NULL;
 static float* dev_environmentPdfSolidAngle = NULL;
 static TextureInfo* dev_textures = NULL;
 static glm::vec4* dev_textureTexels = NULL;
@@ -104,14 +105,16 @@ static int dev_textureCount = 0;
 struct DeviceEnvironmentMap
 {
     const glm::vec3* texels = NULL;
-    const float* cdf = NULL;
+    const float* aliasProbability = NULL;
+    const int* aliasIndex = NULL;
     const float* pdfSolidAngle = NULL;
     int width = 0;
     int height = 0;
 
     __host__ __device__ bool valid() const
     {
-        return texels != NULL && cdf != NULL && pdfSolidAngle != NULL && width > 0 && height > 0;
+        return texels != NULL && aliasProbability != NULL && aliasIndex != NULL &&
+            pdfSolidAngle != NULL && width > 0 && height > 0;
     }
 };
 
@@ -140,8 +143,23 @@ struct DevicePrimitiveStore
 };
 
 static DevicePrimitiveStore dev_primitiveStore;
+
+// A fixed-width queue: a shading thread owns the slot at its current path
+// index. Inactive entries
+// are skipped by the dedicated shadow traversal kernel.
+struct ShadowRay
+{
+    Ray ray;
+    glm::vec3 contribution;
+    float maxDistance;
+    int pathIndex;
+    int active;
+    int occluded;
+};
+
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
+static ShadowRay* dev_shadowRays = NULL;
 static int* dev_materialSortKeys = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 // ...
@@ -206,15 +224,19 @@ void pathtraceInit(Scene* scene)
     {
         const size_t environmentPixelCount = scene->environment.texels.size();
         cudaMalloc(&dev_environmentTexels, environmentPixelCount * sizeof(glm::vec3));
-        cudaMalloc(&dev_environmentCdf, environmentPixelCount * sizeof(float));
+        cudaMalloc(&dev_environmentAliasProbability, environmentPixelCount * sizeof(float));
+        cudaMalloc(&dev_environmentAliasIndex, environmentPixelCount * sizeof(int));
         cudaMalloc(&dev_environmentPdfSolidAngle, environmentPixelCount * sizeof(float));
         cudaMemcpy(dev_environmentTexels, scene->environment.texels.data(),
             environmentPixelCount * sizeof(glm::vec3), cudaMemcpyHostToDevice);
-        cudaMemcpy(dev_environmentCdf, scene->environment.cdf.data(),
+        cudaMemcpy(dev_environmentAliasProbability, scene->environment.aliasProbability.data(),
             environmentPixelCount * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(dev_environmentAliasIndex, scene->environment.aliasIndex.data(),
+            environmentPixelCount * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(dev_environmentPdfSolidAngle, scene->environment.pdfSolidAngle.data(),
             environmentPixelCount * sizeof(float), cudaMemcpyHostToDevice);
-        dev_environment = { dev_environmentTexels, dev_environmentCdf, dev_environmentPdfSolidAngle,
+        dev_environment = { dev_environmentTexels, dev_environmentAliasProbability,
+            dev_environmentAliasIndex, dev_environmentPdfSolidAngle,
             scene->environment.width, scene->environment.height };
     }
 
@@ -231,6 +253,8 @@ void pathtraceInit(Scene* scene)
 
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
+
+    cudaMalloc(&dev_shadowRays, pixelcount * sizeof(ShadowRay));
 
     cudaMalloc(&dev_materialSortKeys, pixelcount * sizeof(int));
 
@@ -250,14 +274,17 @@ void pathtraceFree()
     cudaFree(dev_materials);
     cudaFree(dev_lightPrimitives);
     cudaFree(dev_environmentTexels);
-    cudaFree(dev_environmentCdf);
+    cudaFree(dev_environmentAliasProbability);
+    cudaFree(dev_environmentAliasIndex);
     cudaFree(dev_environmentPdfSolidAngle);
     cudaFree(dev_textures);
     cudaFree(dev_textureTexels);
     cudaFree(dev_intersections);
+    cudaFree(dev_shadowRays);
     cudaFree(dev_materialSortKeys);
     dev_environmentTexels = NULL;
-    dev_environmentCdf = NULL;
+    dev_environmentAliasProbability = NULL;
+    dev_environmentAliasIndex = NULL;
     dev_environmentPdfSolidAngle = NULL;
     dev_environment = DeviceEnvironmentMap{};
     dev_textures = NULL;
@@ -269,6 +296,7 @@ void pathtraceFree()
     dev_spheres = NULL;
     dev_triangles = NULL;
     dev_primitiveStore = DevicePrimitiveStore{};
+    dev_shadowRays = NULL;
 
     checkCUDAError("pathtraceFree");
 }
@@ -728,17 +756,12 @@ __device__ EnvironmentSample sampleEnvironment(const DeviceEnvironmentMap& envir
     if (!environment.valid()) return sample;
 
     thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
-    const float chooseTexel = fminf(u01(rng), 0.99999994f);
-    int low = 0;
-    int high = environment.width * environment.height - 1;
-    while (low < high)
-    {
-        const int middle = low + (high - low) / 2;
-        if (environment.cdf[middle] >= chooseTexel) high = middle;
-        else low = middle + 1;
-    }
-
-    const int texelIndex = low;
+    const int texelCount = environment.width * environment.height;
+    const float aliasSample = fminf(u01(rng), 0.99999994f) * texelCount;
+    const int column = min(static_cast<int>(aliasSample), texelCount - 1);
+    const float coinFlip = aliasSample - column;
+    const int texelIndex = coinFlip < environment.aliasProbability[column] ?
+        column : environment.aliasIndex[column];
     const int x = texelIndex % environment.width;
     const int y = texelIndex / environment.width;
     const float u = (static_cast<float>(x) + u01(rng)) / static_cast<float>(environment.width);
@@ -968,67 +991,74 @@ __device__ float bsdfPdf(const Material& material, const glm::vec3& incoming,
         (1.0f - specularProbability) * diffusePdf;
 }
 
-__device__ glm::vec3 estimateDirectLighting(const Material& material, const PathSegment& pathSegment,
+// Sample one direct-light strategy and enqueue its visibility ray.  The
+// contribution is applied later only when traceShadowRays marks it visible.
+__device__ void enqueueDirectLighting(const Material& material, const PathSegment& pathSegment,
     const glm::vec3& intersectionPoint, const glm::vec3& normal, const DevicePrimitiveStore& primitiveStore,
     const Material* materials, const int* lightPrimitives, int emissiveLightCount,
-    const DeviceEnvironmentMap& environment, int totalLightCount, const BVHNode* bvhNodes,
-    int bvhNodeCount, const int* bvhPrimitiveIndices, thrust::default_random_engine& rng)
+    const DeviceEnvironmentMap& environment, int totalLightCount, int pathIndex,
+    ShadowRay& shadowRay, thrust::default_random_engine& rng)
 {
-    if (totalLightCount <= 0) return glm::vec3(0.0f);
+    shadowRay.active = 0;
+    shadowRay.pathIndex = pathIndex;
+    if (totalLightCount <= 0) return;
     thrust::uniform_int_distribution<int> chooseLight(0, totalLightCount - 1);
     const int chosenLight = chooseLight(rng);
     const glm::vec3 offsetNormal = glm::dot(pathSegment.ray.direction, normal) < 0.0f ? normal : -normal;
 
+    // Environment is the sole non-geometric light entry.
     if (chosenLight == emissiveLightCount)
     {
         const EnvironmentSample sample = sampleEnvironment(environment, rng);
-        if (!sample.valid) return glm::vec3(0.0f);
+        if (!sample.valid) return;
         const float cosSurface = fmaxf(0.0f, glm::dot(offsetNormal, sample.direction));
-        if (cosSurface <= 0.0f) return glm::vec3(0.0f);
-        const Ray shadowRay{ intersectionPoint + 0.001f * offsetNormal, sample.direction };
-        if (isOccluded(shadowRay, FLT_MAX, primitiveStore, bvhNodes, bvhNodeCount, bvhPrimitiveIndices))
-            return glm::vec3(0.0f);
+        if (cosSurface <= 0.0f) return;
         const float lightPdf = sample.pdfSolidAngle / static_cast<float>(totalLightCount);
         const float scatteringPdf = bsdfPdf(material, pathSegment.ray.direction, sample.direction, normal);
-        if (lightPdf <= EPSILON) return glm::vec3(0.0f);
+        if (lightPdf <= EPSILON) return;
         const float lightPdf2 = lightPdf * lightPdf;
         const float misWeight = lightPdf2 / (lightPdf2 + scatteringPdf * scatteringPdf);
-        return evaluateDirectBSDF(material, pathSegment.ray.direction, sample.direction, normal) *
+        shadowRay.ray = { intersectionPoint + 0.001f * offsetNormal, sample.direction };
+        shadowRay.maxDistance = FLT_MAX;
+        shadowRay.contribution = pathSegment.color *
+            evaluateDirectBSDF(material, pathSegment.ray.direction, sample.direction, normal) *
             sample.radiance * (cosSurface * misWeight / lightPdf);
+        shadowRay.occluded = 0;
+        shadowRay.active = 1;
+        return;
     }
 
-    // The only non-geometry entry is the environment entry immediately after
-    // the emissive primitives, so a valid selection below is always a surface.
-    if (chosenLight >= emissiveLightCount) return glm::vec3(0.0f);
+    if (chosenLight >= emissiveLightCount) return;
     const PrimitiveRef& light = primitiveStore.primitives[lightPrimitives[chosenLight]];
     const LightSurfaceSample sample = sampleLightSurface(light, primitiveStore, rng);
-    if (!sample.valid) return glm::vec3(0.0f);
+    if (!sample.valid) return;
 
     const glm::vec3 shadowOrigin = intersectionPoint + 0.001f * offsetNormal;
     const glm::vec3 toLight = sample.position - shadowOrigin;
     const float distance2 = glm::dot(toLight, toLight);
-    if (distance2 <= EPSILON) return glm::vec3(0.0f);
+    if (distance2 <= EPSILON) return;
     const float distance = sqrtf(distance2);
     const glm::vec3 wi = toLight / distance;
     const float cosSurface = fmaxf(0.0f, glm::dot(offsetNormal, wi));
     // Emissive primitives radiate from their front side only.  Their front
     // side is the outward primitive normal (or triangle winding normal).
     const float cosLight = glm::dot(sample.normal, -wi);
-    if (cosSurface <= 0.0f || cosLight <= EPSILON) return glm::vec3(0.0f);
-
-    Ray shadowRay{ shadowOrigin, wi };
-    if (isOccluded(shadowRay, distance - 0.001f, primitiveStore, bvhNodes, bvhNodeCount, bvhPrimitiveIndices))
-        return glm::vec3(0.0f);
+    if (cosSurface <= 0.0f || cosLight <= EPSILON) return;
 
     const float lightPdf = distance2 * sample.pdfArea /
         (cosLight * static_cast<float>(totalLightCount));
     const float scatteringPdf = bsdfPdf(material, pathSegment.ray.direction, wi, normal);
-    if (lightPdf <= EPSILON) return glm::vec3(0.0f);
+    if (lightPdf <= EPSILON) return;
     const float lightPdf2 = lightPdf * lightPdf;
     const float misWeight = lightPdf2 / (lightPdf2 + scatteringPdf * scatteringPdf);
     const Material& lightMaterial = materials[primitiveMaterialId(light, primitiveStore)];
-    return evaluateDirectBSDF(material, pathSegment.ray.direction, wi, normal) *
+    shadowRay.ray = { shadowOrigin, wi };
+    shadowRay.maxDistance = distance - 0.001f;
+    shadowRay.contribution = pathSegment.color *
+        evaluateDirectBSDF(material, pathSegment.ray.direction, wi, normal) *
         emittedRadiance(lightMaterial) * (cosSurface * misWeight / lightPdf);
+    shadowRay.occluded = 0;
+    shadowRay.active = 1;
 }
 
 __global__ void shadeBSDF(
@@ -1037,20 +1067,21 @@ __global__ void shadeBSDF(
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
+    ShadowRay* shadowRays,
     Material* materials,
     DevicePrimitiveStore primitiveStore,
     const int* lightPrimitives,
     int emissiveLightCount,
     DeviceEnvironmentMap environment,
     DeviceTextureStore textureStore,
-    int lightCount,
-    const BVHNode* bvhNodes,
-    int bvhNodeCount,
-    const int* bvhPrimitiveIndices)
+    int lightCount)
 {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < num_paths) {
+        // The queue is reused for every bounce; paths that do not sample a
+        // non-delta direct-light strategy leave an inactive entry.
+        shadowRays[idx].active = 0;
         ShadeableIntersection intersection = shadeableIntersections[idx];
         if (intersection.t > 0.0f)
         {
@@ -1106,15 +1137,13 @@ __global__ void shadeBSDF(
                     pathSegment.pixelIndex,
                     pathSegment.remainingBounces);
                 glm::vec3 intersect = pathSegment.ray.origin + intersection.t * pathSegment.ray.direction;
-                // One uniformly selected emissive primitive is sampled at
-                // every non-delta vertex.  The light and BSDF PDFs share the
-                // power heuristic, with the matching BSDF-hit weight above.
+                // Sample emissive primitive at non-delta vertex
+				// Use power heuristic to weight the BSDF and light PDFs
                 if (material.type != MATERIAL_MIRROR && material.type != MATERIAL_DIELECTRIC)
                 {
-                    pathSegment.radiance += pathSegment.color * estimateDirectLighting(material,
+                    enqueueDirectLighting(material,
                         pathSegment, intersect, normal, primitiveStore, materials, lightPrimitives, emissiveLightCount,
-                        environment, lightCount,
-                        bvhNodes, bvhNodeCount, bvhPrimitiveIndices, rng);
+                        environment, lightCount, idx, shadowRays[idx], rng);
                 }
                 switch (material.type)
                 {
@@ -1240,6 +1269,40 @@ __global__ void shadeBSDF(
     }
 }
 
+// Traverse only the visibility rays enqueued by shadeBSDF.
+__global__ void traceShadowRays(
+    int numShadowRays,
+    ShadowRay* shadowRays,
+    DevicePrimitiveStore primitiveStore,
+    const BVHNode* bvhNodes,
+    int bvhNodeCount,
+    const int* bvhPrimitiveIndices)
+{
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= numShadowRays || !shadowRays[index].active) return;
+
+    ShadowRay& shadowRay = shadowRays[index];
+    shadowRay.occluded = isOccluded(shadowRay.ray, shadowRay.maxDistance,
+        primitiveStore, bvhNodes, bvhNodeCount, bvhPrimitiveIndices) ? 1 : 0;
+}
+
+// A path owns at most one queue entry per bounce, so these writes are
+// contention-free and can be applied before terminated paths are gathered.
+__global__ void accumulateVisibleDirectLighting(
+    int numShadowRays,
+    const ShadowRay* shadowRays,
+    PathSegment* pathSegments)
+{
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= numShadowRays) return;
+
+    const ShadowRay& shadowRay = shadowRays[index];
+    if (shadowRay.active && !shadowRay.occluded)
+    {
+        pathSegments[shadowRay.pathIndex].radiance += shadowRay.contribution;
+    }
+}
+
 __global__ void buildMaterialSortKeys(
     int num_paths,
     int material_count,
@@ -1298,6 +1361,13 @@ struct IsTerminated {
     }
 };
 
+struct IsInactiveShadowRay {
+    __host__ __device__
+        bool operator()(const ShadowRay& s) const {
+        return !s.active;
+	}
+};
+
 /**
  * Wrapper for the __global__ call that sets up the kernel calls and does a ton
  * of memory management
@@ -1318,35 +1388,6 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     const int blockSize1d = 128;
     const int totalLightCount = dev_lightPrimitiveCount + (dev_environment.valid() ? 1 : 0);
 
-    ///////////////////////////////////////////////////////////////////////////
-
-    // Recap:
-    // * Initialize array of path rays (using rays that come out of the camera)
-    //   * You can pass the Camera object to that kernel.
-    //   * Each path ray must carry at minimum a (ray, color) pair,
-    //   * where color starts as the multiplicative identity, white = (1, 1, 1).
-    //   * This has already been done for you.
-    // * For each depth:
-    //   * Compute an intersection in the scene for each path ray.
-    //     A very naive version of this has been implemented for you, but feel
-    //     free to add more primitives and/or a better algorithm.
-    //     Currently, intersection distance is recorded as a parametric distance,
-    //     t, or a "distance along the ray." t = -1.0 indicates no intersection.
-    //     * Color is attenuated (multiplied) by reflections off of any object
-    //   * TODO: Stream compact away all of the terminated paths.
-    //     You may use either your implementation or `thrust::remove_if` or its
-    //     cousins.
-    //     * Note that you can't really use a 2D kernel launch any more - switch
-    //       to 1D.
-    //   * TODO: Shade the rays that intersected something or didn't bottom out.
-    //     That is, color the ray by performing a color computation according
-    //     to the shader, then generate a new ray to continue the ray path.
-    //     We recommend just updating the ray's PathSegment in place.
-    //     Note that this step may come before or after stream compaction,
-    //     since some shaders you write may also cause a path to terminate.
-    // * Finally, add this iteration's results to the image. This has been done
-    //   for you.
-
     const float focalLength = guiData ? guiData->FocalLength : 2.0f;
     const float lensRadius = guiData ? guiData->LensRadius : 0.008f;
 
@@ -1364,7 +1405,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     while (!iterationComplete)
     {
         // clean shading chunks
-        cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
+        //cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
         // tracing
         dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
@@ -1416,18 +1457,46 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             num_paths,
             dev_intersections,
             dev_paths,
+            dev_shadowRays,
             dev_materials,
             dev_primitiveStore,
             dev_lightPrimitives,
             dev_lightPrimitiveCount,
             dev_environment,
             dev_textureStore,
-            totalLightCount,
-            dev_bvhNodes,
-            static_cast<int>(hst_scene->bvhNodes.size()),
-            dev_bvhPrimitiveIndices
+            totalLightCount
         );
-        checkCUDAError("shade materials");
+        checkCUDAError("shade materials and enqueue shadow rays");
+
+        // Compact the queue before traversal. pathIndex remains valid after
+        // the move, so visible contributions are still written to their owner.
+        ShadowRay* dev_shadow_end = thrust::remove_if(
+            thrust::device,
+            dev_shadowRays,
+            dev_shadowRays + num_paths,
+            IsInactiveShadowRay());
+        const int numShadowRays = static_cast<int>(dev_shadow_end - dev_shadowRays);
+
+        if (numShadowRays > 0)
+        {
+            const dim3 shadowBlocks = (numShadowRays + blockSize1d - 1) / blockSize1d;
+            traceShadowRays<<<shadowBlocks, blockSize1d>>>(
+                numShadowRays,
+                dev_shadowRays,
+                dev_primitiveStore,
+                dev_bvhNodes,
+                static_cast<int>(hst_scene->bvhNodes.size()),
+                dev_bvhPrimitiveIndices
+            );
+            checkCUDAError("trace shadow rays");
+
+            accumulateVisibleDirectLighting<<<shadowBlocks, blockSize1d>>>(
+                numShadowRays,
+                dev_shadowRays,
+                dev_paths
+            );
+            checkCUDAError("accumulate visible direct lighting");
+        }
 
         gatherTerminatedPaths<<<numblocksPathSegmentTracing, blockSize1d>>>(
             num_paths,
@@ -1436,6 +1505,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         );
         checkCUDAError("gather terminated paths");
 
+		//stream compaction: remove terminated paths from dev_paths
         dev_path_end = thrust::remove_if(
             thrust::device,
             dev_paths,
