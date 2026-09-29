@@ -112,6 +112,29 @@ __host__ __device__ inline bool traversalBoundsTest(const Ray& ray,
     return true;
 }
 
+// Decide once per ray whether the branch-free slab test is safe. Parallel
+// rays and overflowing reciprocals keep the robust face/zero handling above.
+__host__ __device__ inline bool hasFiniteRayReciprocals(const glm::vec3& inverseDirection)
+{
+    const float x = fabsf(inverseDirection.x);
+    const float y = fabsf(inverseDirection.y);
+    const float z = fabsf(inverseDirection.z);
+    return x > 0.0f && x <= FLT_MAX && y > 0.0f && y <= FLT_MAX && z > 0.0f && z <= FLT_MAX;
+}
+
+__host__ __device__ inline bool traversalBoundsTestFast(const Ray& ray,
+    const glm::vec3& inverseDirection, const glm::vec3& lower,
+    const glm::vec3& upper, float maxDistance)
+{
+    const glm::vec3 a = (lower - ray.origin) * inverseDirection;
+    const glm::vec3 b = (upper - ray.origin) * inverseDirection;
+    const float nearT = fmaxf(0.0f, fmaxf(fminf(a.x, b.x),
+        fmaxf(fminf(a.y, b.y), fminf(a.z, b.z))));
+    const float farT = fminf(maxDistance, fminf(fmaxf(a.x, b.x),
+        fminf(fmaxf(a.y, b.y), fmaxf(a.z, b.z))));
+    return nearT <= farT;
+}
+
 // Do not normalize the object-space direction: affine transforms preserve t.
 // These distance-only tests are inlined into both closest-hit and any-hit code.
 __host__ __device__ inline float boxDistanceTest(const Cube& box, const Ray& ray,

@@ -70,22 +70,6 @@ __device__ void coordinateSystem(const glm::vec3& normal, glm::vec3& tangent, gl
     bitangent = glm::normalize(glm::cross(normal, tangent));
 }
 
-__device__ glm::vec3 worldToLocal(const glm::vec3& normal, const glm::vec3& v)
-{
-    glm::vec3 tangent;
-    glm::vec3 bitangent;
-    coordinateSystem(normal, tangent, bitangent);
-    return glm::vec3(glm::dot(v, tangent), glm::dot(v, bitangent), glm::dot(v, normal));
-}
-
-__device__ glm::vec3 localToWorld(const glm::vec3& normal, const glm::vec3& v)
-{
-    glm::vec3 tangent;
-    glm::vec3 bitangent;
-    coordinateSystem(normal, tangent, bitangent);
-    return glm::normalize(v.x * tangent + v.y * bitangent + v.z * normal);
-}
-
 __device__ float absCosTheta(const glm::vec3& v)
 {
     return fabsf(v.z);
@@ -142,7 +126,12 @@ __device__ bool scatterRoughSpecular(
         normal = -normal;
     }
 
-    glm::vec3 wo = worldToLocal(normal, -incoming);
+    // Reuse one frame for both transformations of this sample.
+    glm::vec3 tangent;
+    glm::vec3 bitangent;
+    coordinateSystem(normal, tangent, bitangent);
+    const glm::vec3 wo(glm::dot(-incoming, tangent), glm::dot(-incoming, bitangent),
+        glm::dot(-incoming, normal));
     if (wo.z == 0.0f)
     {
         scatterMirror(pathSegment, intersect, normal);
@@ -151,7 +140,7 @@ __device__ bool scatterRoughSpecular(
 
     glm::vec3 wh = sampleTrowbridgeReitzWh(wo, roughness, rng);
     glm::vec3 wi = glm::reflect(-wo, wh);
-    pathSegment.ray.direction = localToWorld(normal, wi);
+    pathSegment.ray.direction = glm::normalize(wi.x * tangent + wi.y * bitangent + wi.z * normal);
     pathSegment.ray.origin = intersect + 0.001f * pathSegment.ray.direction;
     if (!sameHemisphere(wo, wi))
     {
@@ -198,13 +187,13 @@ __device__ void scatterDielectric(
     PathSegment& pathSegment,
     const glm::vec3& intersect,
     glm::vec3 normal,
-    const Material& material,
+    float indexOfRefraction,
     thrust::default_random_engine& rng)
 {
     normal = glm::normalize(normal);
     glm::vec3 incoming = glm::normalize(pathSegment.ray.direction);
 
-    float eta = material.indexOfRefraction > 0.0f ? material.indexOfRefraction : 1.55f;
+    float eta = indexOfRefraction > 0.0f ? indexOfRefraction : 1.55f;
     bool entering = glm::dot(incoming, normal) < 0.0f;
     glm::vec3 orientedNormal = entering ? normal : -normal;
     float etaI = entering ? 1.0f : eta;

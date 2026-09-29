@@ -35,8 +35,8 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
  * - Pick the split based on the intensity of each material color, and divide
  *   branch result by that branch's probability (whatever probability you use).
  *
- * These helpers only update the next ray. BSDF throughput is evaluated by
- * shadeBSDF so all path radiance updates happen in one place.
+ * These helpers only update the next ray. The shading pipeline handles
+ * BSDF throughput and accumulated radiance separately.
  *
  * You may need to change the parameter list for your purposes!
  */
@@ -62,5 +62,5 @@ __device__ void scatterDielectric(
     PathSegment& pathSegment,
     const glm::vec3& intersect,
     glm::vec3 normal,
-    const Material& material,
+    float indexOfRefraction,
     thrust::default_random_engine& rng);
