@@ -135,8 +135,9 @@ struct Material
     float alphaCutoff;
 };
 
-// Texture texels are packed into Scene::textureTexels.  texelOffset points
-// into that flat array so this POD descriptor can be copied directly to CUDA.
+// Texture texels are packed as RGBA8 in Scene::textureTexels. texelOffset
+// points into that flat array so this POD descriptor can be copied directly
+// to CUDA without the 4x expansion of a float RGBA image.
 struct TextureInfo
 {
     int width;

@@ -136,7 +136,7 @@ static float* dev_environmentAliasProbability = NULL;
 static int* dev_environmentAliasIndex = NULL;
 static float* dev_environmentPdfSolidAngle = NULL;
 static TextureInfo* dev_textures = NULL;
-static glm::vec4* dev_textureTexels = NULL;
+static uchar4* dev_textureTexels = NULL;
 static int dev_textureCount = 0;
 
 struct DeviceEnvironmentMap
@@ -160,7 +160,7 @@ static DeviceEnvironmentMap dev_environment;
 struct DeviceTextureStore
 {
     const TextureInfo* textures = NULL;
-    const glm::vec4* texels = NULL;
+    const uchar4* texels = NULL;
     int textureCount = 0;
 
     __host__ __device__ bool validTextureIndex(int textureIndex) const
@@ -507,10 +507,10 @@ void pathtraceInit(Scene* scene)
     if (dev_textureCount > 0 && !scene->textureTexels.empty())
     {
         cudaMalloc(&dev_textures, dev_textureCount * sizeof(TextureInfo));
-        cudaMalloc(&dev_textureTexels, scene->textureTexels.size() * sizeof(glm::vec4));
+        cudaMalloc(&dev_textureTexels, scene->textureTexels.size() * sizeof(uchar4));
         cudaMemcpy(dev_textures, scene->textures.data(), dev_textureCount * sizeof(TextureInfo), cudaMemcpyHostToDevice);
         cudaMemcpy(dev_textureTexels, scene->textureTexels.data(),
-            scene->textureTexels.size() * sizeof(glm::vec4), cudaMemcpyHostToDevice);
+            scene->textureTexels.size() * sizeof(uchar4), cudaMemcpyHostToDevice);
         dev_textureStore = { dev_textures, dev_textureTexels, dev_textureCount };
     }
 
@@ -1125,7 +1125,8 @@ __device__ glm::vec4 sampleTexture(const TextureInfo& texture, const glm::vec2& 
     const auto texelAt = [&](int x, int y) {
         x = wrapTextureTexel(x, texture.width, texture.wrapS);
         y = wrapTextureTexel(y, texture.height, texture.wrapT);
-        return textureStore.texels[texture.texelOffset + y * texture.width + x];
+        const uchar4 encoded = textureStore.texels[texture.texelOffset + y * texture.width + x];
+        return glm::vec4(encoded.x, encoded.y, encoded.z, encoded.w) * (1.0f / 255.0f);
     };
 
     // glTF UV (0, 0) corresponds to the first decoded image row, so V is not

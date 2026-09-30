@@ -18,11 +18,12 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
-#include <iterator>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace std;
@@ -36,6 +37,11 @@ constexpr uint32_t GLB_BIN_CHUNK = 0x004E4942;
 constexpr int GLTF_MODE_TRIANGLES = 4;
 constexpr int BVH_LEAF_SIZE = 4;
 constexpr int BVH_SAH_BINS = 16;
+constexpr size_t FILE_READ_CHUNK_SIZE = 64ull * 1024ull * 1024ull;
+// Keep all imported material textures within a predictable host/device memory
+// budget. Small scenes retain their original resolution; large collections
+// are uniformly reduced before being stored as packed RGBA8.
+constexpr size_t GLTF_TEXTURE_TEXEL_BUDGET = 64ull * 1024ull * 1024ull;
 
 struct Bounds
 {
@@ -183,28 +189,61 @@ vector<unsigned char> readBinaryFile(const filesystem::path& path)
 {
     ifstream input(path, ios::binary);
     if (!input) throw runtime_error("could not open " + path.string());
-    return vector<unsigned char>(istreambuf_iterator<char>(input), istreambuf_iterator<char>());
+
+    input.seekg(0, ios::end);
+    const streampos end = input.tellg();
+    const streamoff byteCount = static_cast<streamoff>(end);
+    if (byteCount < 0 || static_cast<uintmax_t>(byteCount) > numeric_limits<size_t>::max())
+        throw runtime_error("could not determine the size of " + path.string());
+    input.seekg(0, ios::beg);
+
+    vector<unsigned char> bytes(static_cast<size_t>(byteCount));
+    size_t offset = 0;
+    while (offset < bytes.size())
+    {
+        const size_t count = min(bytes.size() - offset, FILE_READ_CHUNK_SIZE);
+        input.read(reinterpret_cast<char*>(bytes.data() + offset), static_cast<streamsize>(count));
+        if (!input) throw runtime_error("could not read " + path.string());
+        offset += count;
+    }
+    return bytes;
 }
 
-uint32_t readLE32(const vector<unsigned char>& bytes, size_t offset)
+void readExact(istream& input, void* destination, size_t byteCount, const char* description)
 {
-    if (offset + 4 > bytes.size()) throw runtime_error("truncated GLB");
-    return uint32_t(bytes[offset]) | (uint32_t(bytes[offset + 1]) << 8) |
-        (uint32_t(bytes[offset + 2]) << 16) | (uint32_t(bytes[offset + 3]) << 24);
+    unsigned char* output = static_cast<unsigned char*>(destination);
+    size_t offset = 0;
+    while (offset < byteCount)
+    {
+        const size_t count = min(byteCount - offset, FILE_READ_CHUNK_SIZE);
+        input.read(reinterpret_cast<char*>(output + offset), static_cast<streamsize>(count));
+        if (!input) throw runtime_error(string("truncated GLB while reading ") + description);
+        offset += count;
+    }
+}
+
+uint32_t readLE32(istream& input, const char* description)
+{
+    unsigned char bytes[4];
+    readExact(input, bytes, sizeof(bytes), description);
+    return uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) |
+        (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
 }
 
 vector<unsigned char> decodeBase64(const string& encoded)
 {
     static const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     vector<unsigned char> result;
-    int value = 0, bits = -8;
+    result.reserve(encoded.size() / 4 * 3);
+    uint32_t value = 0;
+    int bits = -8;
     for (unsigned char c : encoded)
     {
         if (isspace(c)) continue;
         if (c == '=') break;
         const size_t digit = alphabet.find(static_cast<char>(c));
         if (digit == string::npos) throw runtime_error("invalid base64 URI");
-        value = (value << 6) + static_cast<int>(digit);
+        value = (value << 6) | static_cast<uint32_t>(digit);
         bits += 6;
         if (bits >= 0) { result.push_back(static_cast<unsigned char>((value >> bits) & 0xff)); bits -= 8; }
     }
@@ -251,11 +290,94 @@ AccessorView getAccessor(const json& document, const vector<vector<unsigned char
     result.count = accessor.at("count").get<size_t>();
     const size_t packedSize = componentSize(result.componentType) * result.components;
     result.stride = view.value("byteStride", packedSize);
-    result.offset = view.value("byteOffset", size_t(0)) + accessor.value("byteOffset", size_t(0));
-    if (result.stride < packedSize || (result.count &&
-        (result.offset > result.buffer->size() || result.stride > (result.buffer->size() - result.offset) / (result.count - 1) ||
-         packedSize > result.buffer->size() - result.offset - result.stride * (result.count - 1)))) throw runtime_error("accessor exceeds its buffer");
+    const size_t viewOffset = view.value("byteOffset", size_t(0));
+    const size_t viewLength = view.at("byteLength").get<size_t>();
+    const size_t accessorOffset = accessor.value("byteOffset", size_t(0));
+    if (viewOffset > result.buffer->size() || viewLength > result.buffer->size() - viewOffset)
+        throw runtime_error("buffer view exceeds its buffer");
+    if (accessorOffset > viewLength) throw runtime_error("accessor starts outside its buffer view");
+    result.offset = viewOffset + accessorOffset;
+    const size_t available = viewLength - accessorOffset;
+    if (result.stride < packedSize) throw runtime_error("accessor stride is smaller than its element");
+    if (result.count > 0)
+    {
+        if (packedSize > available ||
+            (result.count > 1 && result.count - 1 > (available - packedSize) / result.stride))
+            throw runtime_error("accessor exceeds its buffer view");
+    }
     return result;
+}
+
+string decodeUriPath(const string& uri)
+{
+    const auto hexDigit = [](unsigned char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        c = static_cast<unsigned char>(tolower(c));
+        return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+    };
+    string decoded;
+    decoded.reserve(uri.size());
+    for (size_t i = 0; i < uri.size(); ++i)
+    {
+        if (uri[i] != '%')
+        {
+            decoded.push_back(uri[i]);
+            continue;
+        }
+        if (i + 2 >= uri.size()) throw runtime_error("invalid percent escape in URI");
+        const int high = hexDigit(static_cast<unsigned char>(uri[i + 1]));
+        const int low = hexDigit(static_cast<unsigned char>(uri[i + 2]));
+        if (high < 0 || low < 0 || (high == 0 && low == 0)) throw runtime_error("invalid percent escape in URI");
+        decoded.push_back(static_cast<char>((high << 4) | low));
+        i += 2;
+    }
+    return decoded;
+}
+
+struct EncodedImage
+{
+    vector<unsigned char> ownedBytes;
+    const unsigned char* borrowedBytes = nullptr;
+    size_t byteCount = 0;
+
+    const unsigned char* data() const
+    {
+        return ownedBytes.empty() ? borrowedBytes : ownedBytes.data();
+    }
+};
+
+void appendTextureImage(vector<uchar4>& destination, const unsigned char* source,
+    int sourceWidth, int sourceHeight, int targetWidth, int targetHeight)
+{
+    const size_t oldSize = destination.size();
+    const size_t targetTexelCount = static_cast<size_t>(targetWidth) * targetHeight;
+    if (targetTexelCount > numeric_limits<size_t>::max() - oldSize)
+        throw runtime_error("texture texel count is too large");
+    destination.resize(oldSize + targetTexelCount);
+
+    uchar4* output = destination.data() + oldSize;
+    if (sourceWidth == targetWidth && sourceHeight == targetHeight)
+    {
+        static_assert(sizeof(uchar4) == 4, "uchar4 must contain four packed bytes");
+        memcpy(output, source, targetTexelCount * sizeof(uchar4));
+        return;
+    }
+
+    // A center sample is enough here because device-side linear filtering is
+    // still applied. More importantly, work is proportional to the retained
+    // texture data rather than every source pixel in a multi-gigabyte set.
+    for (int y = 0; y < targetHeight; ++y)
+    {
+        const int sourceY = min(sourceHeight - 1,
+            static_cast<int>((static_cast<int64_t>(2 * y + 1) * sourceHeight) / (2ll * targetHeight)));
+        for (int x = 0; x < targetWidth; ++x)
+        {
+            const int sourceX = min(sourceWidth - 1,
+                static_cast<int>((static_cast<int64_t>(2 * x + 1) * sourceWidth) / (2ll * targetWidth)));
+            const unsigned char* rgba = source + (static_cast<size_t>(sourceY) * sourceWidth + sourceX) * 4;
+            output[static_cast<size_t>(y) * targetWidth + x] = make_uchar4(rgba[0], rgba[1], rgba[2], rgba[3]);
+        }
+    }
 }
 
 vector<glm::vec3> readVec3(const json& document, const vector<vector<unsigned char>>& buffers, int accessorIndex)
@@ -743,18 +865,43 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         vector<unsigned char> binaryChunk;
         if (lowercase(inputPath.extension().string()) == ".glb")
         {
-            const vector<unsigned char> glb = readBinaryFile(inputPath);
-            if (glb.size() < 12 || readLE32(glb, 0) != GLB_MAGIC || readLE32(glb, 4) != 2 || readLE32(glb, 8) > glb.size()) throw runtime_error("invalid GLB 2.0 header");
-            size_t offset = 12; string jsonChunk;
-            while (offset + 8 <= glb.size())
+            ifstream input(inputPath, ios::binary);
+            if (!input) throw runtime_error("could not open GLB file");
+            const uintmax_t fileSize = filesystem::file_size(inputPath);
+            if (fileSize < 12 || fileSize > numeric_limits<uint32_t>::max())
+                throw runtime_error("invalid GLB file size");
+            if (readLE32(input, "magic") != GLB_MAGIC || readLE32(input, "version") != 2)
+                throw runtime_error("invalid GLB 2.0 header");
+            const uint32_t declaredLength = readLE32(input, "file length");
+            if (declaredLength != fileSize) throw runtime_error("GLB header length does not match the file size");
+
+            uint64_t remaining = declaredLength - 12ull;
+            string jsonChunk;
+            while (remaining > 0)
             {
-                const uint32_t length = readLE32(glb, offset), type = readLE32(glb, offset + 4); offset += 8;
-                if (offset + length > glb.size()) throw runtime_error("truncated GLB chunk");
-                if (type == GLB_JSON_CHUNK) jsonChunk.assign(reinterpret_cast<const char*>(glb.data() + offset), length);
-                else if (type == GLB_BIN_CHUNK && binaryChunk.empty()) binaryChunk.assign(glb.begin() + offset, glb.begin() + offset + length);
-                offset += length;
+                if (remaining < 8) throw runtime_error("truncated GLB chunk header");
+                const uint32_t length = readLE32(input, "chunk length");
+                const uint32_t type = readLE32(input, "chunk type");
+                remaining -= 8;
+                if (length > remaining) throw runtime_error("truncated GLB chunk");
+                if (type == GLB_JSON_CHUNK && jsonChunk.empty())
+                {
+                    jsonChunk.resize(length);
+                    readExact(input, jsonChunk.data(), jsonChunk.size(), "JSON chunk");
+                }
+                else if (type == GLB_BIN_CHUNK && binaryChunk.empty())
+                {
+                    binaryChunk.resize(length);
+                    readExact(input, binaryChunk.data(), binaryChunk.size(), "binary chunk");
+                }
+                else
+                {
+                    input.seekg(length, ios::cur);
+                    if (!input) throw runtime_error("could not skip GLB chunk");
+                }
+                remaining -= length;
             }
-            while (!jsonChunk.empty() && jsonChunk.back() == '\0') jsonChunk.pop_back();
+            while (!jsonChunk.empty() && (jsonChunk.back() == '\0' || isspace(static_cast<unsigned char>(jsonChunk.back())))) jsonChunk.pop_back();
             if (jsonChunk.empty()) throw runtime_error("GLB has no JSON chunk");
             document = json::parse(jsonChunk);
         }
@@ -766,10 +913,13 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         }
         if (document.value("asset", json::object()).value("version", "") != "2.0") throw runtime_error("only glTF 2.0 is supported");
 
+        const json emptyArray = json::array();
+        const json& bufferDefinitions = document.contains("buffers") ? document.at("buffers") : emptyArray;
         vector<vector<unsigned char>> buffers;
-        for (size_t i = 0; i < document.value("buffers", json::array()).size(); ++i)
+        buffers.reserve(bufferDefinitions.size());
+        for (size_t i = 0; i < bufferDefinitions.size(); ++i)
         {
-            const json& definition = document.at("buffers").at(i); vector<unsigned char> buffer;
+            const json& definition = bufferDefinitions.at(i); vector<unsigned char> buffer;
             if (definition.contains("uri"))
             {
                 const string uri = definition.at("uri").get<string>();
@@ -779,22 +929,82 @@ void Scene::loadFromGLTF(const std::string& gltfName)
                     if (comma == string::npos || uri.find(";base64") == string::npos) throw runtime_error("only base64 data URIs are supported");
                     buffer = decodeBase64(uri.substr(comma + 1));
                 }
-                else buffer = readBinaryFile(inputPath.parent_path() / filesystem::path(uri));
+                else buffer = readBinaryFile(inputPath.parent_path() / filesystem::path(decodeUriPath(uri)));
             }
-            else if (i == 0 && !binaryChunk.empty()) buffer = binaryChunk;
+            else if (i == 0 && !binaryChunk.empty()) buffer = move(binaryChunk);
             else throw runtime_error("buffer has no URI or GLB binary chunk");
             if (buffer.size() < definition.value("byteLength", size_t(0))) throw runtime_error("buffer is shorter than declared");
             buffers.push_back(move(buffer));
         }
 
-        // Decode glTF texture sources before materials reference them.  Both
-        // external/data-URI images and GLB buffer-view images are supported.
-        const json imageDefinitions = document.value("images", json::array());
-        const json textureDefinitions = document.value("textures", json::array());
-        const json samplerDefinitions = document.value("samplers", json::array());
-        vector<int> gltfTextureToSceneTexture(textureDefinitions.size(), -1);
+        // Decode only the texture channels the renderer uses. Images shared by
+        // textures with different samplers share one texel allocation.
+        const json& imageDefinitions = document.contains("images") ? document.at("images") : emptyArray;
+        const json& textureDefinitions = document.contains("textures") ? document.at("textures") : emptyArray;
+        const json& samplerDefinitions = document.contains("samplers") ? document.at("samplers") : emptyArray;
+        const json& materialDefinitions = document.contains("materials") ? document.at("materials") : emptyArray;
+        const json& bufferViews = document.contains("bufferViews") ? document.at("bufferViews") : emptyArray;
+
+        vector<bool> requiredTextures(textureDefinitions.size(), false);
+        const auto requireTexture = [&](const json& textureInfo, const char* usage) {
+            const int textureIndex = textureInfo.value("index", -1);
+            if (textureIndex < 0 || textureIndex >= static_cast<int>(requiredTextures.size()))
+                throw runtime_error(string(usage) + " texture index out of range");
+            requiredTextures[textureIndex] = true;
+        };
+        for (const json& definition : materialDefinitions)
+        {
+            const json pbr = definition.value("pbrMetallicRoughness", json::object());
+            if (pbr.contains("baseColorTexture")) requireTexture(pbr.at("baseColorTexture"), "baseColorTexture");
+            if (definition.contains("normalTexture")) requireTexture(definition.at("normalTexture"), "normalTexture");
+        }
+
+        const auto getEncodedImage = [&](int imageIndex) -> EncodedImage {
+            if (imageIndex < 0 || imageIndex >= static_cast<int>(imageDefinitions.size()))
+                throw runtime_error("texture image index out of range");
+            const json& imageDefinition = imageDefinitions.at(imageIndex);
+            EncodedImage result;
+            if (imageDefinition.contains("uri"))
+            {
+                const string uri = imageDefinition.at("uri").get<string>();
+                if (uri.rfind("data:", 0) == 0)
+                {
+                    const size_t comma = uri.find(',');
+                    if (comma == string::npos || uri.find(";base64") == string::npos)
+                        throw runtime_error("only base64 image data URIs are supported");
+                    result.ownedBytes = decodeBase64(uri.substr(comma + 1));
+                }
+                else result.ownedBytes = readBinaryFile(inputPath.parent_path() / filesystem::path(decodeUriPath(uri)));
+                result.byteCount = result.ownedBytes.size();
+            }
+            else if (imageDefinition.contains("bufferView"))
+            {
+                const int viewIndex = imageDefinition.at("bufferView").get<int>();
+                if (viewIndex < 0 || viewIndex >= static_cast<int>(bufferViews.size()))
+                    throw runtime_error("image bufferView index out of range");
+                const json& view = bufferViews.at(viewIndex);
+                const int bufferIndex = view.at("buffer").get<int>();
+                if (bufferIndex < 0 || bufferIndex >= static_cast<int>(buffers.size()))
+                    throw runtime_error("image bufferView buffer index out of range");
+                const size_t offset = view.value("byteOffset", size_t(0));
+                result.byteCount = view.at("byteLength").get<size_t>();
+                if (offset > buffers[bufferIndex].size() || result.byteCount > buffers[bufferIndex].size() - offset)
+                    throw runtime_error("image bufferView exceeds its buffer");
+                result.borrowedBytes = buffers[bufferIndex].data() + offset;
+            }
+            else throw runtime_error("glTF image has no URI or bufferView");
+
+            if (result.byteCount == 0 || result.byteCount > static_cast<size_t>(numeric_limits<int>::max()))
+                throw runtime_error("image is empty or too large to decode");
+            return result;
+        };
+
+        struct ImageSize { int sourceWidth = 0, sourceHeight = 0, targetWidth = 0, targetHeight = 0; };
+        vector<ImageSize> imageSizes(imageDefinitions.size());
+        unordered_set<int> requiredImages;
         for (size_t textureIndex = 0; textureIndex < textureDefinitions.size(); ++textureIndex)
         {
+            if (!requiredTextures[textureIndex]) continue;
             const json& textureDefinition = textureDefinitions.at(textureIndex);
             if (!textureDefinition.contains("source"))
             {
@@ -804,68 +1014,93 @@ void Scene::loadFromGLTF(const std::string& gltfName)
             const int imageIndex = textureDefinition.at("source").get<int>();
             if (imageIndex < 0 || imageIndex >= static_cast<int>(imageDefinitions.size()))
                 throw runtime_error("texture image index out of range");
-            const json& imageDefinition = imageDefinitions.at(imageIndex);
-            vector<unsigned char> ownedImageBytes;
-            const unsigned char* imageBytes = nullptr;
-            size_t imageByteCount = 0;
-            if (imageDefinition.contains("uri"))
-            {
-                const string uri = imageDefinition.at("uri").get<string>();
-                if (uri.rfind("data:", 0) == 0)
-                {
-                    const size_t comma = uri.find(',');
-                    if (comma == string::npos || uri.find(";base64") == string::npos)
-                        throw runtime_error("only base64 image data URIs are supported");
-                    ownedImageBytes = decodeBase64(uri.substr(comma + 1));
-                }
-                else
-                {
-                    ownedImageBytes = readBinaryFile(inputPath.parent_path() / filesystem::path(uri));
-                }
-                imageBytes = ownedImageBytes.data();
-                imageByteCount = ownedImageBytes.size();
-            }
-            else if (imageDefinition.contains("bufferView"))
-            {
-                const int viewIndex = imageDefinition.at("bufferView").get<int>();
-                const json& views = document.value("bufferViews", json::array());
-                if (viewIndex < 0 || viewIndex >= static_cast<int>(views.size()))
-                    throw runtime_error("image bufferView index out of range");
-                const json& view = views.at(viewIndex);
-                const int bufferIndex = view.at("buffer").get<int>();
-                if (bufferIndex < 0 || bufferIndex >= static_cast<int>(buffers.size()))
-                    throw runtime_error("image bufferView buffer index out of range");
-                const size_t offset = view.value("byteOffset", size_t(0));
-                imageByteCount = view.at("byteLength").get<size_t>();
-                if (offset > buffers[bufferIndex].size() || imageByteCount > buffers[bufferIndex].size() - offset)
-                    throw runtime_error("image bufferView exceeds its buffer");
-                imageBytes = buffers[bufferIndex].data() + offset;
-            }
-            else
-            {
-                cerr << "Warning: glTF image " << imageIndex << " has no URI or bufferView" << endl;
-                continue;
-            }
-            if (imageByteCount == 0 || imageByteCount > static_cast<size_t>(numeric_limits<int>::max()))
-                throw runtime_error("image is empty or too large to decode");
+            requiredImages.insert(imageIndex);
+        }
 
+        size_t sourceTexelCount = 0;
+        for (int imageIndex : requiredImages)
+        {
+            const EncodedImage encoded = getEncodedImage(imageIndex);
             int width = 0, height = 0, channels = 0;
-            unsigned char* decoded = stbi_load_from_memory(imageBytes, static_cast<int>(imageByteCount),
-                &width, &height, &channels, 4);
-            if (decoded == nullptr || width <= 0 || height <= 0)
+            if (!stbi_info_from_memory(encoded.data(), static_cast<int>(encoded.byteCount), &width, &height, &channels) ||
+                width <= 0 || height <= 0)
             {
-                cerr << "Warning: could not decode glTF texture " << textureIndex << ": "
+                cerr << "Warning: could not inspect glTF image " << imageIndex << ": "
                      << (stbi_failure_reason() ? stbi_failure_reason() : "unknown image error") << endl;
-                if (decoded) stbi_image_free(decoded);
                 continue;
+            }
+            if (static_cast<size_t>(width) > numeric_limits<size_t>::max() / static_cast<size_t>(height))
+                throw runtime_error("texture dimensions are too large");
+            const size_t imageTexels = static_cast<size_t>(width) * height;
+            if (imageTexels > numeric_limits<size_t>::max() - sourceTexelCount)
+                throw runtime_error("texture texel count is too large");
+            sourceTexelCount += imageTexels;
+            imageSizes[imageIndex].sourceWidth = width;
+            imageSizes[imageIndex].sourceHeight = height;
+        }
+
+        const double textureScale = sourceTexelCount > GLTF_TEXTURE_TEXEL_BUDGET ?
+            sqrt(static_cast<double>(GLTF_TEXTURE_TEXEL_BUDGET) / static_cast<double>(sourceTexelCount)) : 1.0;
+        size_t retainedTexelCount = 0;
+        for (int imageIndex : requiredImages)
+        {
+            ImageSize& size = imageSizes[imageIndex];
+            if (size.sourceWidth <= 0 || size.sourceHeight <= 0) continue;
+            size.targetWidth = max(1, min(size.sourceWidth, static_cast<int>(floor(size.sourceWidth * textureScale))));
+            size.targetHeight = max(1, min(size.sourceHeight, static_cast<int>(floor(size.sourceHeight * textureScale))));
+            const size_t imageTexels = static_cast<size_t>(size.targetWidth) * size.targetHeight;
+            if (imageTexels > static_cast<size_t>(numeric_limits<int>::max()) - retainedTexelCount)
+                throw runtime_error("packed texture offsets exceed their 32-bit representation");
+            retainedTexelCount += imageTexels;
+        }
+        textureTexels.reserve(retainedTexelCount);
+        textures.reserve(count(requiredTextures.begin(), requiredTextures.end(), true));
+        if (textureScale < 1.0)
+        {
+            cout << "Texture set contains " << sourceTexelCount << " texels; resizing to approximately "
+                 << retainedTexelCount << " texels (" << retainedTexelCount * sizeof(uchar4) / (1024 * 1024)
+                 << " MiB packed RGBA8)." << endl;
+        }
+
+        struct StoredImage { int width = 0, height = 0, texelOffset = -1; };
+        vector<StoredImage> storedImages(imageDefinitions.size());
+        vector<int> gltfTextureToSceneTexture(textureDefinitions.size(), -1);
+        for (size_t textureIndex = 0; textureIndex < textureDefinitions.size(); ++textureIndex)
+        {
+            if (!requiredTextures[textureIndex]) continue;
+            const json& textureDefinition = textureDefinitions.at(textureIndex);
+            if (!textureDefinition.contains("source")) continue;
+            const int imageIndex = textureDefinition.at("source").get<int>();
+            StoredImage& stored = storedImages.at(imageIndex);
+            if (stored.texelOffset < 0)
+            {
+                const ImageSize& requestedSize = imageSizes.at(imageIndex);
+                if (requestedSize.targetWidth <= 0 || requestedSize.targetHeight <= 0) continue;
+                const EncodedImage encoded = getEncodedImage(imageIndex);
+                int width = 0, height = 0, channels = 0;
+                unique_ptr<unsigned char, decltype(&stbi_image_free)> decoded(
+                    stbi_load_from_memory(encoded.data(), static_cast<int>(encoded.byteCount),
+                        &width, &height, &channels, 4), stbi_image_free);
+                if (!decoded || width <= 0 || height <= 0)
+                {
+                    cerr << "Warning: could not decode glTF image " << imageIndex << ": "
+                         << (stbi_failure_reason() ? stbi_failure_reason() : "unknown image error") << endl;
+                    continue;
+                }
+                const int targetWidth = max(1, min(width, requestedSize.targetWidth));
+                const int targetHeight = max(1, min(height, requestedSize.targetHeight));
+                stored.texelOffset = static_cast<int>(textureTexels.size());
+                stored.width = targetWidth;
+                stored.height = targetHeight;
+                appendTextureImage(textureTexels, decoded.get(), width, height, targetWidth, targetHeight);
             }
 
             TextureInfo texture{};
-            texture.width = width;
-            texture.height = height;
-            texture.texelOffset = static_cast<int>(textureTexels.size());
+            texture.width = stored.width;
+            texture.height = stored.height;
+            texture.texelOffset = stored.texelOffset;
             // glTF defaults: REPEAT wrapping and implementation-defined
-            // filtering.  Store explicit sampler values when they are present.
+            // filtering. Store explicit sampler values when they are present.
             texture.wrapS = 10497;
             texture.wrapT = 10497;
             texture.minFilter = -1;
@@ -881,16 +1116,13 @@ void Scene::loadFromGLTF(const std::string& gltfName)
                 texture.minFilter = sampler.value("minFilter", texture.minFilter);
                 texture.magFilter = sampler.value("magFilter", texture.magFilter);
             }
-            const size_t texelCount = static_cast<size_t>(width) * height;
-            textureTexels.reserve(textureTexels.size() + texelCount);
-            for (size_t texel = 0; texel < texelCount; ++texel)
-            {
-                const unsigned char* rgba = decoded + texel * 4;
-                textureTexels.push_back(glm::vec4(rgba[0], rgba[1], rgba[2], rgba[3]) / 255.0f);
-            }
-            stbi_image_free(decoded);
             gltfTextureToSceneTexture[textureIndex] = static_cast<int>(textures.size());
             textures.push_back(texture);
+        }
+        if (!textures.empty())
+        {
+            cout << "Loaded " << textures.size() << " material textures using "
+                 << textureTexels.size() * sizeof(uchar4) / (1024 * 1024) << " MiB." << endl;
         }
 
         const auto resolveTexture = [&](const json& textureInfo, const char* usage) -> int {
@@ -908,7 +1140,7 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         };
 
         vector<int> materialIDs;
-        for (const json& definition : document.value("materials", json::array()))
+        for (const json& definition : materialDefinitions)
         {
             Material material = makeDefaultMaterial(); material.type = MATERIAL_COOK_TORRANCE;
             const json pbr = definition.value("pbrMetallicRoughness", json::object());
@@ -982,10 +1214,53 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         Material defaultMaterial = makeDefaultMaterial(); defaultMaterial.type = MATERIAL_COOK_TORRANCE; materials.push_back(defaultMaterial);
 
         bool hasBounds = false; glm::vec3 boundsMin(0.0f), boundsMax(0.0f);
-        const json meshes = document.value("meshes", json::array());
+        const json& meshes = document.contains("meshes") ? document.at("meshes") : emptyArray;
+        const json& nodes = document.contains("nodes") ? document.at("nodes") : emptyArray;
+        const json& scenes = document.contains("scenes") ? document.at("scenes") : emptyArray;
+
+        // Avoid repeated reallocations while expanding indexed meshes into the
+        // flat triangle representation. Account for mesh instancing when the
+        // same mesh is referenced by more than one node.
+        vector<size_t> meshInstanceCounts(meshes.size(), 0);
+        for (const json& node : nodes)
+        {
+            if (!node.contains("mesh")) continue;
+            const int meshIndex = node.at("mesh").get<int>();
+            if (meshIndex < 0 || meshIndex >= static_cast<int>(meshes.size()))
+                throw runtime_error("node mesh index out of range");
+            ++meshInstanceCounts[meshIndex];
+        }
+        size_t estimatedTriangleCount = 0;
+        const json& accessors = document.contains("accessors") ? document.at("accessors") : emptyArray;
+        for (size_t meshIndex = 0; meshIndex < meshes.size(); ++meshIndex)
+        {
+            if (meshInstanceCounts[meshIndex] == 0) continue;
+            const json& mesh = meshes.at(meshIndex);
+            const json& meshPrimitives = mesh.contains("primitives") ? mesh.at("primitives") : emptyArray;
+            size_t meshTriangleCount = 0;
+            for (const json& primitive : meshPrimitives)
+            {
+                if (primitive.value("mode", GLTF_MODE_TRIANGLES) != GLTF_MODE_TRIANGLES) continue;
+                int accessorIndex = -1;
+                if (primitive.contains("indices")) accessorIndex = primitive.at("indices").get<int>();
+                else if (primitive.contains("attributes") && primitive.at("attributes").contains("POSITION"))
+                    accessorIndex = primitive.at("attributes").at("POSITION").get<int>();
+                if (accessorIndex < 0 || accessorIndex >= static_cast<int>(accessors.size())) continue;
+                meshTriangleCount += accessors.at(accessorIndex).value("count", size_t(0)) / 3;
+            }
+            if (meshTriangleCount > (numeric_limits<size_t>::max() - estimatedTriangleCount) /
+                meshInstanceCounts[meshIndex]) throw runtime_error("scene has too many triangles");
+            estimatedTriangleCount += meshTriangleCount * meshInstanceCounts[meshIndex];
+        }
+        if (estimatedTriangleCount > static_cast<size_t>(numeric_limits<int>::max()) - triangles.size())
+            throw runtime_error("scene has too many triangles for 32-bit primitive indices");
+        triangles.reserve(triangles.size() + estimatedTriangleCount);
+        primitives.reserve(primitives.size() + estimatedTriangleCount);
+
         auto importMesh = [&](int meshIndex, const glm::mat4& world) {
             if (meshIndex < 0 || meshIndex >= static_cast<int>(meshes.size())) throw runtime_error("node mesh index out of range");
-            const json meshPrimitives = meshes.at(meshIndex).value("primitives", json::array());
+            const json& mesh = meshes.at(meshIndex);
+            const json& meshPrimitives = mesh.contains("primitives") ? mesh.at("primitives") : emptyArray;
             for (size_t primitiveIndex = 0; primitiveIndex < meshPrimitives.size(); ++primitiveIndex)
             {
                 try
@@ -1034,15 +1309,18 @@ void Scene::loadFromGLTF(const std::string& gltfName)
             }
         };
 
-        const json nodes = document.value("nodes", json::array()), scenes = document.value("scenes", json::array());
         int cameraIndex = -1; glm::mat4 cameraTransform(1.0f);
+        vector<unsigned char> activeNodes(nodes.size(), 0);
         function<void(int, const glm::mat4&)> visitNode;
         visitNode = [&](int nodeIndex, const glm::mat4& parent) {
             if (nodeIndex < 0 || nodeIndex >= static_cast<int>(nodes.size())) throw runtime_error("node index out of range");
+            if (activeNodes[nodeIndex]) throw runtime_error("cycle in glTF node hierarchy");
+            activeNodes[nodeIndex] = 1;
             const json& node = nodes.at(nodeIndex); const glm::mat4 world = parent * getNodeTransform(node);
             if (node.contains("mesh")) importMesh(node.at("mesh").get<int>(), world);
             if (cameraIndex < 0 && node.contains("camera")) { cameraIndex = node.at("camera").get<int>(); cameraTransform = world; }
             for (const json& child : node.value("children", json::array())) visitNode(child.get<int>(), world);
+            activeNodes[nodeIndex] = 0;
         };
         vector<int> roots;
         const int sceneIndex = document.value("scene", scenes.empty() ? -1 : 0);
@@ -1055,6 +1333,7 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         }
         for (int root : roots) visitNode(root, glm::mat4(1.0f));
         if (primitives.empty()) throw runtime_error("scene contains no supported triangle geometry");
+        cout << "Imported " << triangles.size() << " glTF triangles." << endl;
 
         Camera& camera = state.camera; camera.resolution = glm::ivec2(1200, 800); state.iterations = 6000; state.traceDepth = 8; state.imageName = inputPath.stem().string();
         float yscaled = tan(45.0f * PI / 180.0f);

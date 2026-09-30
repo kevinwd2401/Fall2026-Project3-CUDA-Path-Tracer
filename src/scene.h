@@ -24,9 +24,9 @@ public:
     std::vector<int> bvhPrimitiveIndices;
     std::vector<Material> materials;
     std::vector<int> emissivePrimitives;
-    // glTF texture descriptors and their RGBA texels.
+    // glTF texture descriptors and packed RGBA8 texels.
     std::vector<TextureInfo> textures;
-    std::vector<glm::vec4> textureTexels;
+    std::vector<uchar4> textureTexels;
     // An equirectangular, linear HDR image, its directional PDF, and an
     // O(1) alias table used to importance-sample its texels on the device.
     struct EnvironmentMap
