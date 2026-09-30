@@ -1,6 +1,7 @@
 #include "scene.h"
 
 #include "utilities.h"
+#include "pathtrace_config.h"
 
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -35,8 +36,6 @@ constexpr uint32_t GLB_MAGIC = 0x46546C67;
 constexpr uint32_t GLB_JSON_CHUNK = 0x4E4F534A;
 constexpr uint32_t GLB_BIN_CHUNK = 0x004E4942;
 constexpr int GLTF_MODE_TRIANGLES = 4;
-constexpr int BVH_LEAF_SIZE = 4;
-constexpr int BVH_SAH_BINS = 16;
 constexpr size_t FILE_READ_CHUNK_SIZE = 64ull * 1024ull * 1024ull;
 // Keep all imported material textures within a predictable host/device memory
 // budget. Small scenes retain their original resolution; large collections

@@ -406,6 +406,7 @@ int main(int argc, char** argv)
     // Initialize ImGui Data
     InitImguiData(guiData);
     InitDataContainer(guiData);
+    pathtraceInit(scene);
 
     // GLFW main loop
     mainLoop();
@@ -470,8 +471,7 @@ void runCuda()
 
     if (iteration == 0)
     {
-        pathtraceFree();
-        pathtraceInit(scene);
+        pathtraceResetAccumulation();
     }
 
     if (iteration < renderState->iterations)

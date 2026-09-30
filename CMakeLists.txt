@@ -109,6 +109,35 @@ source_group("ImGui\\Sources" FILES ${imgui_sources})
 
 add_executable(${CMAKE_PROJECT_NAME} ${sources} ${headers} ${imgui_sources} ${imgui_headers})
 
+# Benchmark knobs.  They are cache variables so an alternate build can be
+# configured without editing source files, e.g.:
+#   cmake -S . -B build/bench -DMORTON_SORT=0 -DBVH_LEAF_SIZE=8
+set(MATERIAL_SORT 0 CACHE STRING "Group shading work by material")
+set(MORTON_SORT 1 CACHE STRING "Sort traversal rays by Morton code")
+set(MORTON_SORT_MIN_RAYS 4096 CACHE STRING "Minimum queue size for Morton sorting")
+set(TRIANGLE_TRAVERSAL 1 CACHE STRING "Use packed triangle traversal")
+set(RUSSIAN_ROULETTE 1 CACHE STRING "Enable Russian roulette")
+set(RUSSIAN_ROULETTE_START_DEPTH 3 CACHE STRING "Bounce at which roulette starts")
+set(DEPTH_OF_FIELD 1 CACHE STRING "Enable depth-of-field camera sampling")
+set(ERRORCHECK 0 CACHE STRING "Synchronize and check every CUDA stage")
+set(BVH_LEAF_SIZE 4 CACHE STRING "Maximum primitives in a BVH leaf")
+set(BVH_SAH_BINS 16 CACHE STRING "Number of binned SAH partitions")
+set(SHADOW_ALPHA_TRANSMISSION 1 CACHE STRING "Respect alpha in shadow visibility")
+set(SHADOW_RAY_COMPACTION 1 CACHE STRING "Compact inactive shadow rays")
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+    MATERIAL_SORT=${MATERIAL_SORT}
+    MORTON_SORT=${MORTON_SORT}
+    MORTON_SORT_MIN_RAYS=${MORTON_SORT_MIN_RAYS}
+    TRIANGLE_TRAVERSAL=${TRIANGLE_TRAVERSAL}
+    RUSSIAN_ROULETTE=${RUSSIAN_ROULETTE}
+    RUSSIAN_ROULETTE_START_DEPTH=${RUSSIAN_ROULETTE_START_DEPTH}
+    DEPTH_OF_FIELD=${DEPTH_OF_FIELD}
+    ERRORCHECK=${ERRORCHECK}
+    BVH_LEAF_SIZE=${BVH_LEAF_SIZE}
+    BVH_SAH_BINS=${BVH_SAH_BINS}
+    SHADOW_ALPHA_TRANSMISSION=${SHADOW_ALPHA_TRANSMISSION}
+    SHADOW_RAY_COMPACTION=${SHADOW_RAY_COMPACTION})
+
 if (MSVC)
     target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>

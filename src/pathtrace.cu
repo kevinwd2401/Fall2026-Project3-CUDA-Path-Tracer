@@ -18,27 +18,9 @@
 #include "intersections.h"
 #include "interactions.h"
 #include "tonemapping.h"
-
-#ifndef MATERIAL_SORT
-#define MATERIAL_SORT 0
-#endif
+#include "pathtrace_config.h"
 // Morton ordering schedules both closest-hit and shadow traversal by ray
 // origin/direction. Material sorting remains independently available for shading.
-#ifndef MORTON_SORT
-#define MORTON_SORT 1
-#endif
-// Avoid radix/key-generation launches for small tail queues. This is a tuning
-// heuristic; set it to 0 to compare against sorting every queue.
-#ifndef MORTON_SORT_MIN_RAYS
-#define MORTON_SORT_MIN_RAYS 4096
-#endif
-#ifndef TRIANGLE_TRAVERSAL
-#define TRIANGLE_TRAVERSAL 1
-#endif
-#define RUSSIAN_ROULETTE 1
-#define RUSSIAN_ROULETTE_START_DEPTH 3
-#define DEPTH_OF_FIELD 1
-#define ERRORCHECK 0
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -100,6 +82,7 @@ __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm
 static Scene* hst_scene = NULL;
 static GuiDataContainer* guiData = NULL;
 static glm::vec3* dev_image = NULL;
+static size_t imagePixelCount = 0;
 static PrimitiveRef* dev_primitives = NULL;
 static Cube* dev_cubes = NULL;
 static Sphere* dev_spheres = NULL;
@@ -127,6 +110,7 @@ static_assert(sizeof(TraversalTriangle) == 48, "Traversal triangles must occupy 
 static TraversalNode* dev_bvhNodes = NULL;
 static TraversalTriangle* dev_traversalTriangles = NULL;
 static bool trianglesOnly = false;
+static bool hasAlphaMaterials = false;
 static int* dev_bvhPrimitiveIndices = NULL;
 static Material* dev_materials = NULL;
 static int* dev_lightPrimitives = NULL;
@@ -379,6 +363,7 @@ void pathtraceInit(Scene* scene)
 
     const Camera& cam = hst_scene->state.camera;
     const int pixelcount = cam.resolution.x * cam.resolution.y;
+    imagePixelCount = static_cast<size_t>(pixelcount);
 
     cudaMalloc(&dev_image, pixelcount * sizeof(glm::vec3));
     cudaMemset(dev_image, 0, pixelcount * sizeof(glm::vec3));
@@ -474,6 +459,9 @@ void pathtraceInit(Scene* scene)
 
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
+    hasAlphaMaterials = false;
+    for (const Material& material : scene->materials)
+        hasAlphaMaterials = hasAlphaMaterials || material.alphaMode != ALPHA_OPAQUE;
 
     dev_lightPrimitiveCount = static_cast<int>(scene->emissivePrimitives.size());
     if (dev_lightPrimitiveCount > 0)
@@ -523,6 +511,15 @@ void pathtraceInit(Scene* scene)
     initQueueOperations(pixelcount, static_cast<int>(scene->materials.size()));
 
     checkCUDAError("pathtraceInit");
+}
+
+void pathtraceResetAccumulation()
+{
+    if (dev_image == NULL) return;
+	// Just clear accumulated radiance when user adjusts camera/scene parameters.
+    cudaMemset(dev_image, 0, imagePixelCount * sizeof(glm::vec3));
+    if (guiData != NULL) guiData->TracedDepth = 0;
+    checkCUDAError("reset accumulation");
 }
 
 void pathtraceFree()
@@ -578,6 +575,8 @@ void pathtraceFree()
     dev_shadowRays = NULL;
     dev_shadingStates = NULL;
     dev_image = NULL;
+    imagePixelCount = 0;
+    hst_scene = NULL;
     dev_paths = NULL;
     dev_pathsAlternate = NULL;
     dev_intersections = NULL;
@@ -585,6 +584,7 @@ void pathtraceFree()
     dev_bvhNodes = NULL;
     dev_traversalTriangles = NULL;
     trianglesOnly = false;
+    hasAlphaMaterials = false;
     dev_bvhPrimitiveIndices = NULL;
     dev_materials = NULL;
     dev_lightPrimitives = NULL;
@@ -1047,9 +1047,17 @@ __device__ EnvironmentSample sampleEnvironment(const DeviceEnvironmentMap& envir
     return sample;
 }
 
-template <bool TrianglesOnly>
-__device__ __forceinline__ bool isOccluded(const Ray& ray, float maxDistance)
+__device__ float primitiveShadowTransmission(int primitiveIndex, const Ray& ray,
+    float hitDistance, float maxDistance, const glm::vec2& barycentrics,
+    const Material* materials, const DevicePrimitiveStore& primitiveStore,
+    const DeviceTextureStore& textureStore);
+
+template <bool TrianglesOnly, bool AlphaAware>
+__device__ __forceinline__ float shadowTransmittance(const Ray& ray, float maxDistance,
+    const Material* materials, const DevicePrimitiveStore& primitiveStore,
+    const DeviceTextureStore& textureStore)
 {
+    float transmission = 1.0f;
     const glm::vec3 inverseDirection = rayInverseDirection(ray);
     const bool fastBounds = hasFiniteRayReciprocals(inverseDirection);
     int nodeIndex = 0;
@@ -1071,15 +1079,26 @@ __device__ __forceinline__ bool isOccluded(const Ray& ray, float maxDistance)
         }
         for (int offset = 0; offset < countOrEscape; ++offset)
         {
-            int unusedPrimitiveIndex;
-            glm::vec2 unusedBarycentrics;
-            if (intersectLeafPrimitive<TrianglesOnly>(firstPrimitive + offset,
-                ray, maxDistance, unusedBarycentrics, unusedPrimitiveIndex) > 0.0f)
-                return true;
+            int primitiveIndex;
+            glm::vec2 barycentrics;
+            const float t = intersectLeafPrimitive<TrianglesOnly>(firstPrimitive + offset,
+                ray, maxDistance, barycentrics, primitiveIndex);
+            if (t <= 0.0f) continue;
+            if constexpr (!AlphaAware)
+                return 0.0f;
+            else
+            {
+                // Products of surface transparencies do not depend on BVH
+                // visitation order. No repeated traversal or stochastic noise
+                // is needed for alpha-blended shadow visibility.
+                transmission *= primitiveShadowTransmission(primitiveIndex, ray,
+                    t, maxDistance, barycentrics, materials, primitiveStore, textureStore);
+                if (transmission == 0.0f) return 0.0f;
+            }
         }
         ++nodeIndex;
     }
-    return false;
+    return transmission;
 }
 
 __device__ float wrapTextureCoordinate(float coordinate, int wrapMode)
@@ -1146,6 +1165,54 @@ __device__ glm::vec4 sampleTexture(const TextureInfo& texture, const glm::vec2& 
     const glm::vec4 lower = glm::mix(texelAt(x0, y0), texelAt(x0 + 1, y0), tx);
     const glm::vec4 upper = glm::mix(texelAt(x0, y0 + 1), texelAt(x0 + 1, y0 + 1), tx);
     return glm::mix(lower, upper, ty);
+}
+
+__device__ glm::vec2 triangleSurfaceUV(const TriangleAttributes& triangle,
+    const glm::vec2& barycentrics)
+{
+    return (1.0f - barycentrics.x - barycentrics.y) * triangle.triangleUVs[0] +
+        barycentrics.x * triangle.triangleUVs[1] + barycentrics.y * triangle.triangleUVs[2];
+}
+
+__device__ float primitiveShadowTransmission(int primitiveIndex, const Ray& ray,
+    float hitDistance, float maxDistance, const glm::vec2& barycentrics,
+    const Material* materials, const DevicePrimitiveStore& primitiveStore,
+    const DeviceTextureStore& textureStore)
+{
+    const PrimitiveRef& primitive = primitiveStore.primitives[primitiveIndex];
+    const Material& material = materials[primitiveMaterialId(primitive, primitiveStore)];
+    // OPAQUE ignores both the material alpha and the texture alpha.
+    if (material.alphaMode == ALPHA_OPAQUE) return 0.0f;
+
+    float textureAlpha = 1.0f;
+    if (primitive.type == TRIANGLE && textureStore.validTextureIndex(material.baseColorTexture))
+    {
+        const TriangleAttributes& triangle = primitiveStore.triangles.attributes[primitive.index];
+        if (triangle.hasTextureCoordinates)
+            textureAlpha = sampleTexture(textureStore.textures[material.baseColorTexture],
+                triangleSurfaceUV(triangle, barycentrics), textureStore).a;
+    }
+    const float opacity = glm::clamp(material.alpha * textureAlpha, 0.0f, 1.0f);
+    if (material.alphaMode == ALPHA_MASK)
+        return opacity < material.alphaCutoff ? 1.0f : 0.0f;
+
+    float transmission = 1.0f - opacity;
+    if (primitive.type != TRIANGLE && transmission > 0.0f && transmission < 1.0f)
+    {
+        // Cubes/spheres can cross two surfaces within the shadow segment.
+        // Match the alpha pass-through offset used by prepareShading, and
+        // count the exit only when it is still before the sampled light.
+        const float advance = hitDistance + 0.001f;
+        if (advance < maxDistance)
+        {
+            const Ray afterHit{ ray.origin + advance * ray.direction, ray.direction };
+            glm::vec2 unusedBarycentrics;
+            if (intersectPrimitiveDistance(primitive, afterHit, maxDistance - advance,
+                unusedBarycentrics) > 0.0f)
+                transmission *= 1.0f - opacity;
+        }
+    }
+    return transmission;
 }
 
 __device__ float srgbToLinear(float value)
@@ -1383,10 +1450,7 @@ __global__ void prepareShading(
                 const TriangleAttributes& attributes = primitiveStore.triangles.attributes[hitPrimitive.index];
                 if (attributes.hasTextureCoordinates)
                 {
-                    const float u = intersection.barycentrics.x;
-                    const float v = intersection.barycentrics.y;
-                    surfaceUV = (1.0f - u - v) * attributes.triangleUVs[0] +
-                        u * attributes.triangleUVs[1] + v * attributes.triangleUVs[2];
+                    surfaceUV = triangleSurfaceUV(attributes, intersection.barycentrics);
                 }
             }
 
@@ -1660,23 +1724,33 @@ __global__ void shadeBSDF(
 }
 
 // Traverse only the visibility rays enqueued by generateDirectLighting.
-template <bool TrianglesOnly>
+template <bool TrianglesOnly, bool AlphaAware>
 __global__ void traceShadowRays(
     int numShadowRays,
     const ShadowRay* shadowRays,
     const int* rayOrder,
-    PathSegment* pathSegments)
+    PathSegment* pathSegments,
+    const Material* materials,
+    DevicePrimitiveStore primitiveStore,
+    DeviceTextureStore textureStore)
 {
     const int lane = blockIdx.x * blockDim.x + threadIdx.x;
     if (lane >= numShadowRays) return;
     const int index = rayOrder ? rayOrder[lane] : lane;
 
-    // rayOrder contains unique active slots, optionally in Morton order. Each
-    // path still owns one slot, so accumulation does not need atomics.
+    // rayOrder contains unique active slots, optionally in Morton order=
     const ShadowRay& shadowRay = shadowRays[index];
-    if (!isOccluded<TrianglesOnly>(shadowRay.ray, shadowRay.maxDistance))
+    if (shadowRay.active == 0) return;
+#if SHADOW_ALPHA_TRANSMISSION
+    const float transmission = shadowTransmittance<TrianglesOnly, AlphaAware>(
+        shadowRay.ray, shadowRay.maxDistance, materials, primitiveStore, textureStore);
+#else
+    const float transmission = shadowTransmittance<TrianglesOnly, false>(
+        shadowRay.ray, shadowRay.maxDistance, materials, primitiveStore, textureStore);
+#endif
+    if (transmission > 0.0f)
     {
-        pathSegments[shadowRay.pathIndex].radiance += shadowRay.contribution;
+        pathSegments[shadowRay.pathIndex].radiance += transmission * shadowRay.contribution;
     }
 }
 
@@ -1909,8 +1983,14 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         int numShadowRays = 0;
         if (totalLightCount > 0)
         {
+#if SHADOW_RAY_COMPACTION
             numShadowRays = compactShadowIndices(num_paths);
             checkCUDAError("compact shadow indices");
+#else
+            // Keep the full queue to avoid the host readback.  The shadow
+            // kernel checks active, so inactive slots are harmless.
+            numShadowRays = num_paths;
+#endif
         }
 
         if (numShadowRays > 0)
@@ -1920,12 +2000,33 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 #if MORTON_SORT
             shadowOrder = orderRays(numShadowRays, dev_shadowRays, blockSize1d, shadowOrder);
 #endif
-            if (trianglesOnly)
-                traceShadowRays<true><<<shadowBlocks, blockSize1d>>>(
-                    numShadowRays, dev_shadowRays, shadowOrder, dev_paths);
+#if SHADOW_ALPHA_TRANSMISSION
+            if (trianglesOnly && !hasAlphaMaterials)
+                traceShadowRays<true, false><<<shadowBlocks, blockSize1d>>>(
+                    numShadowRays, dev_shadowRays, shadowOrder, dev_paths,
+                    dev_materials, dev_primitiveStore, dev_textureStore);
+            else if (trianglesOnly)
+                traceShadowRays<true, true><<<shadowBlocks, blockSize1d>>>(
+                    numShadowRays, dev_shadowRays, shadowOrder, dev_paths,
+                    dev_materials, dev_primitiveStore, dev_textureStore);
+            else if (!hasAlphaMaterials)
+                traceShadowRays<false, false><<<shadowBlocks, blockSize1d>>>(
+                    numShadowRays, dev_shadowRays, shadowOrder, dev_paths,
+                    dev_materials, dev_primitiveStore, dev_textureStore);
             else
-                traceShadowRays<false><<<shadowBlocks, blockSize1d>>>(
-                    numShadowRays, dev_shadowRays, shadowOrder, dev_paths);
+                traceShadowRays<false, true><<<shadowBlocks, blockSize1d>>>(
+                    numShadowRays, dev_shadowRays, shadowOrder, dev_paths,
+                    dev_materials, dev_primitiveStore, dev_textureStore);
+#else
+            if (trianglesOnly)
+                traceShadowRays<true, false><<<shadowBlocks, blockSize1d>>>(
+                    numShadowRays, dev_shadowRays, shadowOrder, dev_paths,
+                    dev_materials, dev_primitiveStore, dev_textureStore);
+            else
+                traceShadowRays<false, false><<<shadowBlocks, blockSize1d>>>(
+                    numShadowRays, dev_shadowRays, shadowOrder, dev_paths,
+                    dev_materials, dev_primitiveStore, dev_textureStore);
+#endif
             checkCUDAError("trace and accumulate direct lighting");
         }
 
