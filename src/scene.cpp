@@ -450,7 +450,9 @@ Scene::Scene(string filename, string environmentFilename)
     else if (extension == ".gltf" || extension == ".glb") loadFromGLTF(filename);
     else { cout << "Couldn't read from " << filename << endl; exit(-1); }
     if (!environmentFilename.empty()) loadEnvironmentMap(environmentFilename);
+#if USE_BVH
     buildBVH();
+#endif
 }
 
 void Scene::loadEnvironmentMap(const string& filename)

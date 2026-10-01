@@ -179,6 +179,7 @@ struct TraversalData
     const TraversalTriangle* orderedTriangles;
     const int* primitiveIndices;
     int nodeCount;
+    int primitiveCount;
 };
 
 __constant__ TraversalData traversalData;
@@ -230,8 +231,12 @@ static size_t queueScratchBytes = 0;
 static int* dev_selectedCount = NULL;
 static unsigned int* dev_sortKeys[2] = { NULL, NULL };
 static int* dev_sortIndices[2] = { NULL, NULL };
+#if MATERIAL_SORT
 static int materialSortBits = 1;
+#endif
+#if USE_BVH && MORTON_SORT
 static constexpr int mortonSortBits = 30;
+#endif
 
 struct IsActivePath
 {
@@ -251,7 +256,7 @@ struct IsActiveShadowIndex
     }
 };
 
-#if MATERIAL_SORT || MORTON_SORT
+#if MATERIAL_SORT || (USE_BVH && MORTON_SORT)
 size_t radixSortScratchSize(int count, int endBit)
 {
     cub::DoubleBuffer<unsigned int> keys(dev_sortKeys[0], dev_sortKeys[1]);
@@ -281,7 +286,7 @@ void initQueueOperations(int capacity, int materialCount)
     // Buffer 0 is also the compacted list of active shadow indices, including
     // builds with both sorting options disabled.
     cudaMalloc(&dev_sortIndices[0], capacity * sizeof(int));
-#if MATERIAL_SORT || MORTON_SORT
+#if MATERIAL_SORT || (USE_BVH && MORTON_SORT)
     cudaMalloc(&dev_sortIndices[1], capacity * sizeof(int));
     cudaMalloc(&dev_sortKeys[0], capacity * sizeof(unsigned int));
     cudaMalloc(&dev_sortKeys[1], capacity * sizeof(unsigned int));
@@ -307,7 +312,7 @@ void initQueueOperations(int capacity, int materialCount)
     cub::DeviceSelect::If(NULL, bytes, thrust::counting_iterator<int>(0),
         dev_sortIndices[0], dev_selectedCount, capacity, IsActiveShadowIndex{ dev_shadowRays });
     if (bytes > queueScratchBytes) queueScratchBytes = bytes;
-#if MORTON_SORT
+#if USE_BVH && MORTON_SORT
     bytes = radixSortScratchSize(capacity, mortonSortBits);
     if (bytes > queueScratchBytes) queueScratchBytes = bytes;
 #endif
@@ -417,6 +422,7 @@ void pathtraceInit(Scene* scene)
     trianglesOnly = TRIANGLE_TRAVERSAL && !scene->primitives.empty();
     for (const PrimitiveRef& primitive : scene->primitives)
         trianglesOnly = trianglesOnly && primitive.type == TRIANGLE;
+#if USE_BVH
     if (trianglesOnly)
     {
         std::vector<TraversalTriangle> orderedTriangles;
@@ -431,7 +437,9 @@ void pathtraceInit(Scene* scene)
         }
         dev_traversalTriangles = uploadArray(orderedTriangles);
     }
+#endif
 
+#if USE_BVH
     mortonBoundsMin = glm::vec3(0.0f);
     mortonInverseExtent = glm::vec3(0.0f);
     if (!scene->bvhNodes.empty())
@@ -451,10 +459,12 @@ void pathtraceInit(Scene* scene)
         for (int axis = 0; axis < 3; ++axis)
             mortonInverseExtent[axis] = extent[axis] > 1e-8f ? 1.0f / extent[axis] : 0.0f;
     }
+#endif
     const TraversalData traversal = { dev_primitives, dev_cubes, dev_spheres,
         dev_triangleVertices, dev_triangleEdges1, dev_triangleEdges2,
         dev_bvhNodes, dev_traversalTriangles, dev_bvhPrimitiveIndices,
-        static_cast<int>(scene->bvhNodes.size()) };
+        static_cast<int>(scene->bvhNodes.size()),
+        static_cast<int>(scene->primitives.size()) };
     cudaMemcpyToSymbol(traversalData, &traversal, sizeof(traversal));
 
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
@@ -594,7 +604,9 @@ void pathtraceFree()
     dev_selectedCount = NULL;
     dev_sortKeys[0] = dev_sortKeys[1] = NULL;
     dev_sortIndices[0] = dev_sortIndices[1] = NULL;
+#if MATERIAL_SORT
     materialSortBits = 1;
+#endif
 
     checkCUDAError("pathtraceFree");
 }
@@ -766,6 +778,36 @@ __global__ void computeIntersections(int numPaths, const PathSegment* pathSegmen
             }
         }
         ++nodeIndex;
+    }
+    ShadeableIntersection& hit = intersections[pathIndex];
+    hit.t = hitPrimitive < 0 ? -1.0f : closest;
+    hit.primitiveIndex = hitPrimitive;
+    hit.barycentrics = hitBarycentrics;
+}
+
+// Reference traversal for performance comparisons. Every ray tests every
+// scene primitive and does not read the BVH node array.
+__global__ void computeIntersectionsLinear(int numPaths, const PathSegment* pathSegments,
+    const int* rayOrder, ShadeableIntersection* intersections)
+{
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lane >= numPaths) return;
+    const int pathIndex = rayOrder ? rayOrder[lane] : lane;
+    const Ray ray = pathSegments[pathIndex].ray;
+    float closest = FLT_MAX;
+    int hitPrimitive = -1;
+    glm::vec2 hitBarycentrics(0.0f);
+    for (int primitiveIndex = 0; primitiveIndex < traversalData.primitiveCount; ++primitiveIndex)
+    {
+        glm::vec2 barycentrics(0.0f);
+        const float t = intersectPrimitiveDistance(traversalData.primitives[primitiveIndex],
+            ray, closest, barycentrics);
+        if (t > 0.0f)
+        {
+            closest = t;
+            hitPrimitive = primitiveIndex;
+            hitBarycentrics = barycentrics;
+        }
     }
     ShadeableIntersection& hit = intersections[pathIndex];
     hit.t = hitPrimitive < 0 ? -1.0f : closest;
@@ -1092,11 +1134,35 @@ __device__ __forceinline__ float shadowTransmittance(const Ray& ray, float maxDi
                 // visitation order. No repeated traversal or stochastic noise
                 // is needed for alpha-blended shadow visibility.
                 transmission *= primitiveShadowTransmission(primitiveIndex, ray,
-                    t, maxDistance, barycentrics, materials, primitiveStore, textureStore);
+                    t, maxDistance, barycentrics, materials, primitiveStore, textureStore); 
                 if (transmission == 0.0f) return 0.0f;
             }
         }
         ++nodeIndex;
+    }
+    return transmission;
+}
+
+template <bool AlphaAware>
+__device__ __forceinline__ float shadowTransmittanceLinear(const Ray& ray, float maxDistance,
+    const Material* materials, const DevicePrimitiveStore& primitiveStore,
+    const DeviceTextureStore& textureStore)
+{
+    float transmission = 1.0f;
+    for (int primitiveIndex = 0; primitiveIndex < traversalData.primitiveCount; ++primitiveIndex)
+    {
+        glm::vec2 barycentrics(0.0f);
+        const float t = intersectPrimitiveDistance(traversalData.primitives[primitiveIndex],
+            ray, maxDistance, barycentrics);
+        if (t <= 0.0f) continue;
+        if constexpr (!AlphaAware)
+            return 0.0f;
+        else
+        {
+            transmission *= primitiveShadowTransmission(primitiveIndex, ray, t, maxDistance,
+                barycentrics, materials, primitiveStore, textureStore);
+            if (transmission == 0.0f) return 0.0f;
+        }
     }
     return transmission;
 }
@@ -1754,6 +1820,27 @@ __global__ void traceShadowRays(
     }
 }
 
+template <bool AlphaAware>
+__global__ void traceShadowRaysLinear(
+    int numShadowRays,
+    const ShadowRay* shadowRays,
+    const int* rayOrder,
+    PathSegment* pathSegments,
+    const Material* materials,
+    DevicePrimitiveStore primitiveStore,
+    DeviceTextureStore textureStore)
+{
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lane >= numShadowRays) return;
+    const int index = rayOrder ? rayOrder[lane] : lane;
+    const ShadowRay& shadowRay = shadowRays[index];
+    if (shadowRay.active == 0) return;
+    const float transmission = shadowTransmittanceLinear<AlphaAware>(
+        shadowRay.ray, shadowRay.maxDistance, materials, primitiveStore, textureStore);
+    if (transmission > 0.0f)
+        pathSegments[shadowRay.pathIndex].radiance += transmission * shadowRay.contribution;
+}
+
 #if MATERIAL_SORT
 __global__ void buildMaterialSortKeys(
     int num_paths,
@@ -1799,7 +1886,7 @@ __global__ void gatherMaterialSortedPaths(int count, const int* order,
 }
 #endif
 
-#if MORTON_SORT
+#if USE_BVH && MORTON_SORT
 __device__ __forceinline__ unsigned int spreadMortonBits(unsigned int value)
 {
     value = (value | (value << 16)) & 0x030000ffu;
@@ -1913,8 +2000,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     {
         // tracing
         dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
+#if USE_BVH
         const int* traversalOrder = NULL;
-#if MORTON_SORT
+#if USE_BVH && MORTON_SORT
         traversalOrder = orderRays(num_paths, dev_paths, blockSize1d);
 #endif
         if (trianglesOnly)
@@ -1923,6 +2011,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         else
             computeIntersections<false><<<numblocksPathSegmentTracing, blockSize1d>>>(
                 num_paths, dev_paths, traversalOrder, dev_intersections);
+#else
+        computeIntersectionsLinear<<<numblocksPathSegmentTracing, blockSize1d>>>(
+            num_paths, dev_paths, NULL, dev_intersections);
+#endif
         checkCUDAError("trace one bounce");
         depth++;
 
@@ -1996,8 +2088,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         if (numShadowRays > 0)
         {
             const dim3 shadowBlocks = (numShadowRays + blockSize1d - 1) / blockSize1d;
+#if USE_BVH
             const int* shadowOrder = dev_sortIndices[0];
-#if MORTON_SORT
+#if USE_BVH && MORTON_SORT
             shadowOrder = orderRays(numShadowRays, dev_shadowRays, blockSize1d, shadowOrder);
 #endif
 #if SHADOW_ALPHA_TRANSMISSION
@@ -2026,6 +2119,27 @@ void pathtrace(uchar4* pbo, int frame, int iter)
                 traceShadowRays<false, false><<<shadowBlocks, blockSize1d>>>(
                     numShadowRays, dev_shadowRays, shadowOrder, dev_paths,
                     dev_materials, dev_primitiveStore, dev_textureStore);
+#endif
+#else
+#if SHADOW_RAY_COMPACTION
+            const int* shadowOrder = dev_sortIndices[0];
+#else
+            const int* shadowOrder = NULL;
+#endif
+#if SHADOW_ALPHA_TRANSMISSION
+            if (hasAlphaMaterials)
+                traceShadowRaysLinear<true><<<shadowBlocks, blockSize1d>>>(
+                    numShadowRays, dev_shadowRays, shadowOrder, dev_paths,
+                    dev_materials, dev_primitiveStore, dev_textureStore);
+            else
+                traceShadowRaysLinear<false><<<shadowBlocks, blockSize1d>>>(
+                    numShadowRays, dev_shadowRays, shadowOrder, dev_paths,
+                    dev_materials, dev_primitiveStore, dev_textureStore);
+#else
+            traceShadowRaysLinear<false><<<shadowBlocks, blockSize1d>>>(
+                numShadowRays, dev_shadowRays, shadowOrder, dev_paths,
+                dev_materials, dev_primitiveStore, dev_textureStore);
+#endif
 #endif
             checkCUDAError("trace and accumulate direct lighting");
         }

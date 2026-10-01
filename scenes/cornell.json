@@ -24,7 +24,7 @@
         },
         "specular_white":
         {
-            "TYPE":"Dielectric",
+            "TYPE":"Diffuse",
             "RGB":[0.98, 0.98, 0.98],
             "ROUGHNESS":0.0
         }
@@ -44,7 +44,7 @@
     [
         {
             "TYPE":"cube",
-            "MATERIAL":"diffuse_white",
+            "MATERIAL":"light",
             "TRANS":[0.0,10.0,0.0],
             "ROTAT":[0.0,0.0,0.0],
             "SCALE":[3.0,0.3,3.0]

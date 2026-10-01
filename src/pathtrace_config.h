@@ -1,8 +1,12 @@
 #pragma once
 
-// Compile-time benchmark controls.  Override any value with nvcc/CMake, for
-// example: -DMORTON_SORT=0 -DBVH_LEAF_SIZE=8.  Keep correctness-preserving
-// defaults here; change one knob at a time when comparing timings.
+// Compile-time benchmark controls
+
+#ifndef USE_BVH
+// 1 uses the flattened SAH BVH; 0 skips BVH construction/upload and tests
+// every primitive in the linear traversal kernels for a baseline.
+#define USE_BVH 1
+#endif
 
 #ifndef MATERIAL_SORT
 #define MATERIAL_SORT 0
