@@ -63,6 +63,7 @@ if(NOT NANOVDB_INCLUDE_DIR)
 endif()
 
 set(headers
+    external/include/tiny_gltf.h
     src/image.h
     src/tonemapping.h
     src/interactions.h

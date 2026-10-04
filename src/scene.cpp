@@ -9,6 +9,14 @@
 #include "json.hpp"
 #include <stb_image.h>
 
+// Compile the pinned C++ tinygltf implementation in this host translation unit.
+// Texture decoding stays deferred so only used maps consume the texel budget.
+#define TINYGLTF_IMPLEMENTATION
+#define TINYGLTF_NO_STB_IMAGE
+#define TINYGLTF_NO_STB_IMAGE_WRITE
+#define TINYGLTF_NO_EXTERNAL_IMAGE
+#include <tiny_gltf.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -32,10 +40,6 @@ using json = nlohmann::json;
 
 namespace
 {
-constexpr uint32_t GLB_MAGIC = 0x46546C67;
-constexpr uint32_t GLB_JSON_CHUNK = 0x4E4F534A;
-constexpr uint32_t GLB_BIN_CHUNK = 0x004E4942;
-constexpr int GLTF_MODE_TRIANGLES = 4;
 constexpr size_t FILE_READ_CHUNK_SIZE = 64ull * 1024ull * 1024ull;
 // Keep all imported material textures within a predictable host/device memory
 // budget. Small scenes retain their original resolution; large collections
@@ -150,6 +154,7 @@ Material makeDefaultMaterial()
     material.roughness = 1.0f;
     material.baseColorTexture = -1;
     material.normalTexture = -1;
+    material.metallicRoughnessTexture = -1;
     material.normalScale = 1.0f;
     material.alphaMode = ALPHA_OPAQUE;
     material.alphaCutoff = 0.5f;
@@ -210,59 +215,50 @@ vector<unsigned char> readBinaryFile(const filesystem::path& path)
     return bytes;
 }
 
-void readExact(istream& input, void* destination, size_t byteCount, const char* description)
+// Keep chunked reads for large assets while tinygltf owns container/URI parsing.
+bool readGLTFFile(vector<unsigned char>* output, string* error,
+    const string& filename, void*)
 {
-    unsigned char* output = static_cast<unsigned char*>(destination);
-    size_t offset = 0;
-    while (offset < byteCount)
+    try
     {
-        const size_t count = min(byteCount - offset, FILE_READ_CHUNK_SIZE);
-        input.read(reinterpret_cast<char*>(output + offset), static_cast<streamsize>(count));
-        if (!input) throw runtime_error(string("truncated GLB while reading ") + description);
-        offset += count;
+        *output = readBinaryFile(filesystem::path(filename));
+        return true;
+    }
+    catch (const exception& failure)
+    {
+        if (error) *error = failure.what();
+        return false;
     }
 }
 
-uint32_t readLE32(istream& input, const char* description)
+// Data-URI bytes must survive parsing. Buffer-view images can borrow the model's
+// buffers later; external images are read on demand (TINYGLTF_NO_EXTERNAL_IMAGE).
+bool retainEncodedGLTFImage(tinygltf::Image* image, int, string* error, string*,
+    int, int, const unsigned char* bytes, int size, void*)
 {
-    unsigned char bytes[4];
-    readExact(input, bytes, sizeof(bytes), description);
-    return uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) |
-        (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
-}
-
-vector<unsigned char> decodeBase64(const string& encoded)
-{
-    static const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    vector<unsigned char> result;
-    result.reserve(encoded.size() / 4 * 3);
-    uint32_t value = 0;
-    int bits = -8;
-    for (unsigned char c : encoded)
+    image->as_is = true;
+    if (image->bufferView >= 0) return true;
+    if (size <= 0 || bytes == nullptr)
     {
-        if (isspace(c)) continue;
-        if (c == '=') break;
-        const size_t digit = alphabet.find(static_cast<char>(c));
-        if (digit == string::npos) throw runtime_error("invalid base64 URI");
-        value = (value << 6) | static_cast<uint32_t>(digit);
-        bits += 6;
-        if (bits >= 0) { result.push_back(static_cast<unsigned char>((value >> bits) & 0xff)); bits -= 8; }
+        if (error) *error += "embedded image is empty or too large to decode";
+        return false;
     }
-    return result;
+    image->image.assign(bytes, bytes + size);
+    return true;
 }
 
-size_t componentSize(int type)
+const tinygltf::Value& gltfMember(const tinygltf::Value& object, const string& key)
 {
-    switch (type) { case 5120: case 5121: return 1; case 5122: case 5123: return 2; case 5125: case 5126: return 4; default: throw runtime_error("unsupported accessor component type"); }
+    static const tinygltf::Value absent;
+    return object.IsObject() ? object.Get(key) : absent;
 }
 
-int componentCount(const string& type)
+float gltfNumber(const tinygltf::Value& object, const string& key, float fallback)
 {
-    if (type == "SCALAR") return 1;
-    if (type == "VEC2") return 2;
-    if (type == "VEC3") return 3;
-    if (type == "VEC4") return 4;
-    throw runtime_error("unsupported accessor type");
+    if (!object.Has(key)) return fallback;
+    const tinygltf::Value& value = object.Get(key);
+    if (!value.IsNumber()) throw runtime_error(key + " must be a number");
+    return static_cast<float>(value.GetNumberAsDouble());
 }
 
 struct AccessorView
@@ -272,28 +268,31 @@ struct AccessorView
     int componentType, components;
 };
 
-AccessorView getAccessor(const json& document, const vector<vector<unsigned char>>& buffers, int accessorIndex)
+AccessorView getAccessor(const tinygltf::Model& model, int accessorIndex)
 {
-    const auto& accessors = document.at("accessors");
-    if (accessorIndex < 0 || accessorIndex >= static_cast<int>(accessors.size())) throw runtime_error("accessor index out of range");
-    const json& accessor = accessors.at(accessorIndex);
-    if (accessor.contains("sparse") || !accessor.contains("bufferView")) throw runtime_error("sparse or bufferless accessors are unsupported");
-    const auto& views = document.at("bufferViews");
-    const int viewIndex = accessor.at("bufferView").get<int>();
-    if (viewIndex < 0 || viewIndex >= static_cast<int>(views.size())) throw runtime_error("buffer view index out of range");
-    const json& view = views.at(viewIndex);
-    const int bufferIndex = view.at("buffer").get<int>();
-    if (bufferIndex < 0 || bufferIndex >= static_cast<int>(buffers.size())) throw runtime_error("buffer index out of range");
+    if (accessorIndex < 0 || accessorIndex >= static_cast<int>(model.accessors.size()))
+        throw runtime_error("accessor index out of range");
+    const tinygltf::Accessor& accessor = model.accessors[accessorIndex];
+    if (accessor.sparse.isSparse || accessor.bufferView < 0)
+        throw runtime_error("sparse or bufferless accessors are unsupported");
+    if (accessor.bufferView >= static_cast<int>(model.bufferViews.size()))
+        throw runtime_error("buffer view index out of range");
+    const tinygltf::BufferView& view = model.bufferViews[accessor.bufferView];
+    if (view.buffer < 0 || view.buffer >= static_cast<int>(model.buffers.size()))
+        throw runtime_error("buffer index out of range");
     AccessorView result{};
-    result.buffer = &buffers.at(bufferIndex);
-    result.componentType = accessor.at("componentType").get<int>();
-    result.components = componentCount(accessor.at("type").get<string>());
-    result.count = accessor.at("count").get<size_t>();
-    const size_t packedSize = componentSize(result.componentType) * result.components;
-    result.stride = view.value("byteStride", packedSize);
-    const size_t viewOffset = view.value("byteOffset", size_t(0));
-    const size_t viewLength = view.at("byteLength").get<size_t>();
-    const size_t accessorOffset = accessor.value("byteOffset", size_t(0));
+    result.buffer = &model.buffers[view.buffer].data;
+    result.componentType = accessor.componentType;
+    result.components = tinygltf::GetNumComponentsInType(accessor.type);
+    result.count = accessor.count;
+    const int componentBytes = tinygltf::GetComponentSizeInBytes(result.componentType);
+    if (componentBytes <= 0 || result.components <= 0)
+        throw runtime_error("unsupported accessor type");
+    const size_t packedSize = static_cast<size_t>(componentBytes) * result.components;
+    result.stride = view.byteStride ? view.byteStride : packedSize;
+    const size_t viewOffset = view.byteOffset;
+    const size_t viewLength = view.byteLength;
+    const size_t accessorOffset = accessor.byteOffset;
     if (viewOffset > result.buffer->size() || viewLength > result.buffer->size() - viewOffset)
         throw runtime_error("buffer view exceeds its buffer");
     if (accessorOffset > viewLength) throw runtime_error("accessor starts outside its buffer view");
@@ -307,32 +306,6 @@ AccessorView getAccessor(const json& document, const vector<vector<unsigned char
             throw runtime_error("accessor exceeds its buffer view");
     }
     return result;
-}
-
-string decodeUriPath(const string& uri)
-{
-    const auto hexDigit = [](unsigned char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        c = static_cast<unsigned char>(tolower(c));
-        return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
-    };
-    string decoded;
-    decoded.reserve(uri.size());
-    for (size_t i = 0; i < uri.size(); ++i)
-    {
-        if (uri[i] != '%')
-        {
-            decoded.push_back(uri[i]);
-            continue;
-        }
-        if (i + 2 >= uri.size()) throw runtime_error("invalid percent escape in URI");
-        const int high = hexDigit(static_cast<unsigned char>(uri[i + 1]));
-        const int low = hexDigit(static_cast<unsigned char>(uri[i + 2]));
-        if (high < 0 || low < 0 || (high == 0 && low == 0)) throw runtime_error("invalid percent escape in URI");
-        decoded.push_back(static_cast<char>((high << 4) | low));
-        i += 2;
-    }
-    return decoded;
 }
 
 struct EncodedImage
@@ -381,9 +354,9 @@ void appendTextureImage(vector<uchar4>& destination, const unsigned char* source
     }
 }
 
-vector<glm::vec3> readVec3(const json& document, const vector<vector<unsigned char>>& buffers, int accessorIndex)
+vector<glm::vec3> readVec3(const tinygltf::Model& model, int accessorIndex)
 {
-    const AccessorView view = getAccessor(document, buffers, accessorIndex);
+    const AccessorView view = getAccessor(model, accessorIndex);
     if (view.componentType != 5126 || view.components != 3) throw runtime_error("POSITION/NORMAL must be FLOAT VEC3");
     vector<glm::vec3> values(view.count);
     for (size_t i = 0; i < view.count; ++i)
@@ -395,9 +368,9 @@ vector<glm::vec3> readVec3(const json& document, const vector<vector<unsigned ch
     return values;
 }
 
-vector<glm::vec2> readVec2(const json& document, const vector<vector<unsigned char>>& buffers, int accessorIndex)
+vector<glm::vec2> readVec2(const tinygltf::Model& model, int accessorIndex)
 {
-    const AccessorView view = getAccessor(document, buffers, accessorIndex);
+    const AccessorView view = getAccessor(model, accessorIndex);
     if (view.componentType != 5126 || view.components != 2) throw runtime_error("TEXCOORD_0 must be FLOAT VEC2");
     vector<glm::vec2> values(view.count);
     for (size_t i = 0; i < view.count; ++i)
@@ -409,9 +382,9 @@ vector<glm::vec2> readVec2(const json& document, const vector<vector<unsigned ch
     return values;
 }
 
-vector<uint32_t> readIndices(const json& document, const vector<vector<unsigned char>>& buffers, int accessorIndex)
+vector<uint32_t> readIndices(const tinygltf::Model& model, int accessorIndex)
 {
-    const AccessorView view = getAccessor(document, buffers, accessorIndex);
+    const AccessorView view = getAccessor(model, accessorIndex);
     if (view.components != 1) throw runtime_error("indices must be SCALAR");
     vector<uint32_t> values(view.count);
     for (size_t i = 0; i < view.count; ++i)
@@ -425,21 +398,35 @@ vector<uint32_t> readIndices(const json& document, const vector<vector<unsigned 
     return values;
 }
 
-glm::mat4 getNodeTransform(const json& node)
+glm::mat4 getNodeTransform(const tinygltf::Node& node)
 {
-    if (node.contains("matrix"))
+    if (!node.matrix.empty())
     {
-        const auto& values = node.at("matrix");
+        const auto& values = node.matrix;
         if (values.size() != 16) throw runtime_error("node matrix must have 16 values");
         glm::mat4 matrix(1.0f);
-        for (int column = 0; column < 4; ++column) for (int row = 0; row < 4; ++row) matrix[column][row] = values.at(column * 4 + row).get<float>();
+        for (int column = 0; column < 4; ++column)
+            for (int row = 0; row < 4; ++row)
+                matrix[column][row] = static_cast<float>(values.at(column * 4 + row));
         return matrix;
     }
     glm::vec3 translation(0.0f), scale(1.0f);
     glm::quat rotation(1.0f, 0.0f, 0.0f, 0.0f);
-    if (node.contains("translation")) { const auto& v = node.at("translation"); translation = glm::vec3(v.at(0).get<float>(), v.at(1).get<float>(), v.at(2).get<float>()); }
-    if (node.contains("scale")) { const auto& v = node.at("scale"); scale = glm::vec3(v.at(0).get<float>(), v.at(1).get<float>(), v.at(2).get<float>()); }
-    if (node.contains("rotation")) { const auto& v = node.at("rotation"); rotation = glm::quat(v.at(3).get<float>(), v.at(0).get<float>(), v.at(1).get<float>(), v.at(2).get<float>()); }
+    if (!node.translation.empty())
+    {
+        const auto& v = node.translation;
+        translation = glm::vec3(v.at(0), v.at(1), v.at(2));
+    }
+    if (!node.scale.empty())
+    {
+        const auto& v = node.scale;
+        scale = glm::vec3(v.at(0), v.at(1), v.at(2));
+    }
+    if (!node.rotation.empty())
+    {
+        const auto& v = node.rotation;
+        rotation = glm::quat(v.at(3), v.at(0), v.at(1), v.at(2));
+    }
     return glm::translate(glm::mat4(1.0f), translation) * glm::mat4_cast(rotation) * glm::scale(glm::mat4(1.0f), scale);
 }
 }
@@ -899,138 +886,81 @@ void Scene::loadFromGLTF(const std::string& gltfName)
     try
     {
         const filesystem::path inputPath(gltfName);
-        json document;
-        vector<unsigned char> binaryChunk;
-        if (lowercase(inputPath.extension().string()) == ".glb")
-        {
-            ifstream input(inputPath, ios::binary);
-            if (!input) throw runtime_error("could not open GLB file");
-            const uintmax_t fileSize = filesystem::file_size(inputPath);
-            if (fileSize < 12 || fileSize > numeric_limits<uint32_t>::max())
-                throw runtime_error("invalid GLB file size");
-            if (readLE32(input, "magic") != GLB_MAGIC || readLE32(input, "version") != 2)
-                throw runtime_error("invalid GLB 2.0 header");
-            const uint32_t declaredLength = readLE32(input, "file length");
-            if (declaredLength != fileSize) throw runtime_error("GLB header length does not match the file size");
-
-            uint64_t remaining = declaredLength - 12ull;
-            string jsonChunk;
-            while (remaining > 0)
-            {
-                if (remaining < 8) throw runtime_error("truncated GLB chunk header");
-                const uint32_t length = readLE32(input, "chunk length");
-                const uint32_t type = readLE32(input, "chunk type");
-                remaining -= 8;
-                if (length > remaining) throw runtime_error("truncated GLB chunk");
-                if (type == GLB_JSON_CHUNK && jsonChunk.empty())
-                {
-                    jsonChunk.resize(length);
-                    readExact(input, jsonChunk.data(), jsonChunk.size(), "JSON chunk");
-                }
-                else if (type == GLB_BIN_CHUNK && binaryChunk.empty())
-                {
-                    binaryChunk.resize(length);
-                    readExact(input, binaryChunk.data(), binaryChunk.size(), "binary chunk");
-                }
-                else
-                {
-                    input.seekg(length, ios::cur);
-                    if (!input) throw runtime_error("could not skip GLB chunk");
-                }
-                remaining -= length;
-            }
-            while (!jsonChunk.empty() && (jsonChunk.back() == '\0' || isspace(static_cast<unsigned char>(jsonChunk.back())))) jsonChunk.pop_back();
-            if (jsonChunk.empty()) throw runtime_error("GLB has no JSON chunk");
-            document = json::parse(jsonChunk);
-        }
-        else
-        {
-            ifstream input(gltfName);
-            if (!input) throw runtime_error("could not open glTF file");
-            document = json::parse(input);
-        }
-        if (document.value("asset", json::object()).value("version", "") != "2.0") throw runtime_error("only glTF 2.0 is supported");
-
-        const json emptyArray = json::array();
-        const json& bufferDefinitions = document.contains("buffers") ? document.at("buffers") : emptyArray;
-        vector<vector<unsigned char>> buffers;
-        buffers.reserve(bufferDefinitions.size());
-        for (size_t i = 0; i < bufferDefinitions.size(); ++i)
-        {
-            const json& definition = bufferDefinitions.at(i); vector<unsigned char> buffer;
-            if (definition.contains("uri"))
-            {
-                const string uri = definition.at("uri").get<string>();
-                if (uri.rfind("data:", 0) == 0)
-                {
-                    const size_t comma = uri.find(',');
-                    if (comma == string::npos || uri.find(";base64") == string::npos) throw runtime_error("only base64 data URIs are supported");
-                    buffer = decodeBase64(uri.substr(comma + 1));
-                }
-                else buffer = readBinaryFile(inputPath.parent_path() / filesystem::path(decodeUriPath(uri)));
-            }
-            else if (i == 0 && !binaryChunk.empty()) buffer = move(binaryChunk);
-            else throw runtime_error("buffer has no URI or GLB binary chunk");
-            if (buffer.size() < definition.value("byteLength", size_t(0))) throw runtime_error("buffer is shorter than declared");
-            buffers.push_back(move(buffer));
-        }
+        tinygltf::Model model;
+        tinygltf::TinyGLTF loader;
+        string error, warning;
+        const tinygltf::FsCallbacks filesystemCallbacks{
+            tinygltf::FileExists, tinygltf::ExpandFilePath, readGLTFFile,
+            tinygltf::WriteWholeFile, tinygltf::GetFileSizeInBytes, nullptr
+        };
+        if (!loader.SetFsCallbacks(filesystemCallbacks, &error)) throw runtime_error(error);
+        loader.SetMaxExternalFileSize(numeric_limits<size_t>::max());
+        loader.SetImageLoader(retainEncodedGLTFImage, nullptr);
+        const uintmax_t fileSize = filesystem::file_size(inputPath);
+        // The pinned tinygltf in-memory entry points use unsigned-int lengths.
+        if (fileSize == 0 || fileSize > numeric_limits<unsigned int>::max())
+            throw runtime_error("glTF/GLB file is empty or too large to parse");
+        const bool loaded = lowercase(inputPath.extension().string()) == ".glb" ?
+            loader.LoadBinaryFromFile(&model, &error, &warning, gltfName) :
+            loader.LoadASCIIFromFile(&model, &error, &warning, gltfName);
+        if (!warning.empty()) cerr << "Warning: " << warning << endl;
+        if (!loaded) throw runtime_error(error.empty() ? "could not parse glTF scene" : error);
+        if (!error.empty()) cerr << "Warning: " << error << endl;
+        if (model.asset.version != "2.0") throw runtime_error("only glTF 2.0 is supported");
 
         // Decode only the texture channels the renderer uses. Images shared by
         // textures with different samplers share one texel allocation.
-        const json& imageDefinitions = document.contains("images") ? document.at("images") : emptyArray;
-        const json& textureDefinitions = document.contains("textures") ? document.at("textures") : emptyArray;
-        const json& samplerDefinitions = document.contains("samplers") ? document.at("samplers") : emptyArray;
-        const json& materialDefinitions = document.contains("materials") ? document.at("materials") : emptyArray;
-        const json& bufferViews = document.contains("bufferViews") ? document.at("bufferViews") : emptyArray;
+        const auto& imageDefinitions = model.images;
+        const auto& textureDefinitions = model.textures;
+        const auto& samplerDefinitions = model.samplers;
+        const auto& materialDefinitions = model.materials;
 
         vector<bool> requiredTextures(textureDefinitions.size(), false);
-        const auto requireTexture = [&](const json& textureInfo, const char* usage) {
-            const int textureIndex = textureInfo.value("index", -1);
+        const auto requireTexture = [&](int textureIndex, const char* usage) {
+            if (textureIndex == -1) return;
             if (textureIndex < 0 || textureIndex >= static_cast<int>(requiredTextures.size()))
                 throw runtime_error(string(usage) + " texture index out of range");
             requiredTextures[textureIndex] = true;
         };
-        for (const json& definition : materialDefinitions)
+        for (const tinygltf::Material& definition : materialDefinitions)
         {
-            const json pbr = definition.value("pbrMetallicRoughness", json::object());
-            if (pbr.contains("baseColorTexture")) requireTexture(pbr.at("baseColorTexture"), "baseColorTexture");
-            if (definition.contains("normalTexture")) requireTexture(definition.at("normalTexture"), "normalTexture");
+            const auto& pbr = definition.pbrMetallicRoughness;
+            requireTexture(pbr.baseColorTexture.index, "baseColorTexture");
+            requireTexture(pbr.metallicRoughnessTexture.index, "metallicRoughnessTexture");
+            requireTexture(definition.normalTexture.index, "normalTexture");
         }
 
         const auto getEncodedImage = [&](int imageIndex) -> EncodedImage {
             if (imageIndex < 0 || imageIndex >= static_cast<int>(imageDefinitions.size()))
                 throw runtime_error("texture image index out of range");
-            const json& imageDefinition = imageDefinitions.at(imageIndex);
+            const tinygltf::Image& image = imageDefinitions[imageIndex];
             EncodedImage result;
-            if (imageDefinition.contains("uri"))
+            if (!image.uri.empty())
             {
-                const string uri = imageDefinition.at("uri").get<string>();
-                if (uri.rfind("data:", 0) == 0)
-                {
-                    const size_t comma = uri.find(',');
-                    if (comma == string::npos || uri.find(";base64") == string::npos)
-                        throw runtime_error("only base64 image data URIs are supported");
-                    result.ownedBytes = decodeBase64(uri.substr(comma + 1));
-                }
-                else result.ownedBytes = readBinaryFile(inputPath.parent_path() / filesystem::path(decodeUriPath(uri)));
+                string decodedUri;
+                if (!tinygltf::URIDecode(image.uri, &decodedUri, nullptr))
+                    throw runtime_error("invalid image URI");
+                result.ownedBytes = readBinaryFile(inputPath.parent_path() / filesystem::path(decodedUri));
                 result.byteCount = result.ownedBytes.size();
             }
-            else if (imageDefinition.contains("bufferView"))
+            else if (image.bufferView >= 0)
             {
-                const int viewIndex = imageDefinition.at("bufferView").get<int>();
-                if (viewIndex < 0 || viewIndex >= static_cast<int>(bufferViews.size()))
+                if (image.bufferView >= static_cast<int>(model.bufferViews.size()))
                     throw runtime_error("image bufferView index out of range");
-                const json& view = bufferViews.at(viewIndex);
-                const int bufferIndex = view.at("buffer").get<int>();
-                if (bufferIndex < 0 || bufferIndex >= static_cast<int>(buffers.size()))
+                const tinygltf::BufferView& view = model.bufferViews[image.bufferView];
+                if (view.buffer < 0 || view.buffer >= static_cast<int>(model.buffers.size()))
                     throw runtime_error("image bufferView buffer index out of range");
-                const size_t offset = view.value("byteOffset", size_t(0));
-                result.byteCount = view.at("byteLength").get<size_t>();
-                if (offset > buffers[bufferIndex].size() || result.byteCount > buffers[bufferIndex].size() - offset)
+                const auto& bytes = model.buffers[view.buffer].data;
+                result.byteCount = view.byteLength;
+                if (view.byteOffset > bytes.size() || result.byteCount > bytes.size() - view.byteOffset)
                     throw runtime_error("image bufferView exceeds its buffer");
-                result.borrowedBytes = buffers[bufferIndex].data() + offset;
+                result.borrowedBytes = bytes.data() + view.byteOffset;
             }
-            else throw runtime_error("glTF image has no URI or bufferView");
+            else
+            {
+                result.borrowedBytes = image.image.data();
+                result.byteCount = image.image.size();
+            }
 
             if (result.byteCount == 0 || result.byteCount > static_cast<size_t>(numeric_limits<int>::max()))
                 throw runtime_error("image is empty or too large to decode");
@@ -1043,13 +973,13 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         for (size_t textureIndex = 0; textureIndex < textureDefinitions.size(); ++textureIndex)
         {
             if (!requiredTextures[textureIndex]) continue;
-            const json& textureDefinition = textureDefinitions.at(textureIndex);
-            if (!textureDefinition.contains("source"))
+            const tinygltf::Texture& textureDefinition = textureDefinitions.at(textureIndex);
+            if (textureDefinition.source == -1)
             {
                 cerr << "Warning: glTF texture " << textureIndex << " has no supported image source" << endl;
                 continue;
             }
-            const int imageIndex = textureDefinition.at("source").get<int>();
+            const int imageIndex = textureDefinition.source;
             if (imageIndex < 0 || imageIndex >= static_cast<int>(imageDefinitions.size()))
                 throw runtime_error("texture image index out of range");
             requiredImages.insert(imageIndex);
@@ -1106,9 +1036,9 @@ void Scene::loadFromGLTF(const std::string& gltfName)
         for (size_t textureIndex = 0; textureIndex < textureDefinitions.size(); ++textureIndex)
         {
             if (!requiredTextures[textureIndex]) continue;
-            const json& textureDefinition = textureDefinitions.at(textureIndex);
-            if (!textureDefinition.contains("source")) continue;
-            const int imageIndex = textureDefinition.at("source").get<int>();
+            const tinygltf::Texture& textureDefinition = textureDefinitions.at(textureIndex);
+            if (textureDefinition.source == -1) continue;
+            const int imageIndex = textureDefinition.source;
             StoredImage& stored = storedImages.at(imageIndex);
             if (stored.texelOffset < 0)
             {
@@ -1143,16 +1073,16 @@ void Scene::loadFromGLTF(const std::string& gltfName)
             texture.wrapT = 10497;
             texture.minFilter = -1;
             texture.magFilter = -1;
-            if (textureDefinition.contains("sampler"))
+            if (textureDefinition.sampler != -1)
             {
-                const int samplerIndex = textureDefinition.at("sampler").get<int>();
+                const int samplerIndex = textureDefinition.sampler;
                 if (samplerIndex < 0 || samplerIndex >= static_cast<int>(samplerDefinitions.size()))
                     throw runtime_error("texture sampler index out of range");
-                const json& sampler = samplerDefinitions.at(samplerIndex);
-                texture.wrapS = sampler.value("wrapS", texture.wrapS);
-                texture.wrapT = sampler.value("wrapT", texture.wrapT);
-                texture.minFilter = sampler.value("minFilter", texture.minFilter);
-                texture.magFilter = sampler.value("magFilter", texture.magFilter);
+                const tinygltf::Sampler& sampler = samplerDefinitions.at(samplerIndex);
+                texture.wrapS = sampler.wrapS;
+                texture.wrapT = sampler.wrapT;
+                texture.minFilter = sampler.minFilter;
+                texture.magFilter = sampler.magFilter;
             }
             gltfTextureToSceneTexture[textureIndex] = static_cast<int>(textures.size());
             textures.push_back(texture);
@@ -1163,56 +1093,57 @@ void Scene::loadFromGLTF(const std::string& gltfName)
                  << textureTexels.size() * sizeof(uchar4) / (1024 * 1024) << " MiB." << endl;
         }
 
-        const auto resolveTexture = [&](const json& textureInfo, const char* usage) -> int {
-            const int textureIndex = textureInfo.value("index", -1);
+        // TextureInfo and NormalTextureInfo have the same lookup fields.
+        const auto resolveTexture = [&](const auto& textureInfo, const char* usage) -> int {
+            const int textureIndex = textureInfo.index;
+            if (textureIndex == -1) return -1;
             if (textureIndex < 0 || textureIndex >= static_cast<int>(gltfTextureToSceneTexture.size()))
                 throw runtime_error(string(usage) + " texture index out of range");
-            if (textureInfo.value("texCoord", 0) != 0)
+            if (textureInfo.texCoord != 0)
             {
                 cerr << "Warning: " << usage << " uses TEXCOORD_1+, which is not supported" << endl;
                 return -1;
             }
-            if (textureInfo.contains("extensions") && textureInfo.at("extensions").contains("KHR_texture_transform"))
+            if (textureInfo.extensions.count("KHR_texture_transform"))
                 cerr << "Warning: " << usage << " KHR_texture_transform is not yet supported" << endl;
             return gltfTextureToSceneTexture[textureIndex];
         };
 
         vector<int> materialIDs;
-        for (const json& definition : materialDefinitions)
+        for (const tinygltf::Material& definition : materialDefinitions)
         {
             Material material = makeDefaultMaterial(); material.type = MATERIAL_COOK_TORRANCE;
-            const json pbr = definition.value("pbrMetallicRoughness", json::object());
-            if (pbr.contains("baseColorFactor"))
-            {
-                const auto& f = pbr.at("baseColorFactor");
-                material.color = glm::vec3(f.at(0).get<float>(), f.at(1).get<float>(), f.at(2).get<float>());
-                material.alpha = glm::clamp(f.at(3).get<float>(), 0.0f, 1.0f);
-            }
-            const string alphaMode = definition.value("alphaMode", "OPAQUE");
-            if (alphaMode == "MASK") material.alphaMode = ALPHA_MASK;
-            else if (alphaMode == "BLEND") material.alphaMode = ALPHA_BLEND;
-            material.alphaCutoff = glm::clamp(definition.value("alphaCutoff", 0.5f), 0.0f, 1.0f);
-            material.metallic = glm::clamp(pbr.value("metallicFactor", 1.0f), 0.0f, 1.0f);
-            material.roughness = glm::clamp(pbr.value("roughnessFactor", 1.0f), 0.001f, 1.0f);
-            material.indexOfRefraction = definition.value("ior", 1.5f);
-            if (definition.contains("emissiveFactor")) { const auto& f = definition.at("emissiveFactor"); material.emission = glm::vec3(f.at(0).get<float>(), f.at(1).get<float>(), f.at(2).get<float>()); }
-            const json extensions = definition.value("extensions", json::object());
+            const auto& pbr = definition.pbrMetallicRoughness;
+            const auto& f = pbr.baseColorFactor;
+            material.color = glm::vec3(f.at(0), f.at(1), f.at(2));
+            material.alpha = glm::clamp(static_cast<float>(f.at(3)), 0.0f, 1.0f);
+            if (definition.alphaMode == "MASK") material.alphaMode = ALPHA_MASK;
+            else if (definition.alphaMode == "BLEND") material.alphaMode = ALPHA_BLEND;
+            material.alphaCutoff = glm::clamp(static_cast<float>(definition.alphaCutoff), 0.0f, 1.0f);
+            material.metallic = glm::clamp(static_cast<float>(pbr.metallicFactor), 0.0f, 1.0f);
+            material.roughness = glm::clamp(static_cast<float>(pbr.roughnessFactor), 0.001f, 1.0f);
+            // Preserve the legacy, nonstandard material-level "ior" property too.
+            const auto legacyIOR = definition.additionalValues.find("ior");
+            material.indexOfRefraction = legacyIOR == definition.additionalValues.end() ?
+                1.5f : static_cast<float>(legacyIOR->second.number_value);
+            const auto& emission = definition.emissiveFactor;
+            material.emission = glm::vec3(emission.at(0), emission.at(1), emission.at(2));
+            const auto& extensions = definition.extensions;
             // pbrt_to_gltf stores physical area-light radiance in extras while
             // emissiveFactor only preserves its normalized display color.
-            // Prefer the former when it is available so imported PBRT Cornell
-            // scenes retain their intended lighting intensity.
-            const json extras = definition.value("extras", json::object());
-            const json pbrt = extras.value("pbrt", json::object());
-            const bool isPbrtDielectric = pbrt.is_object() &&
-                lowercase(pbrt.value("type", string())) == "dielectric";
+            const tinygltf::Value& pbrt = gltfMember(definition.extras, "pbrt");
+            const tinygltf::Value& pbrtType = gltfMember(pbrt, "type");
+            const bool isPbrtDielectric = pbrtType.IsString() &&
+                lowercase(pbrtType.Get<string>()) == "dielectric";
             bool hasPbrtAreaLightRadiance = false;
-            if (pbrt.is_object() && pbrt.contains("area_light_radiance_rgb"))
+            if (pbrt.Has("area_light_radiance_rgb"))
             {
-                const json& radiance = pbrt.at("area_light_radiance_rgb");
-                if (radiance.is_array() && radiance.size() >= 3)
+                const tinygltf::Value& radiance = pbrt.Get("area_light_radiance_rgb");
+                if (radiance.IsArray() && radiance.ArrayLen() >= 3 &&
+                    radiance.Get(0).IsNumber() && radiance.Get(1).IsNumber() && radiance.Get(2).IsNumber())
                 {
-                    material.emission = glm::vec3(radiance.at(0).get<float>(),
-                        radiance.at(1).get<float>(), radiance.at(2).get<float>());
+                    material.emission = glm::vec3(radiance.Get(0).GetNumberAsDouble(),
+                        radiance.Get(1).GetNumberAsDouble(), radiance.Get(2).GetNumberAsDouble());
                     hasPbrtAreaLightRadiance = true;
                 }
                 else
@@ -1220,71 +1151,69 @@ void Scene::loadFromGLTF(const std::string& gltfName)
                     cerr << "Warning: ignoring malformed pbrt area-light radiance for material " << materialIDs.size() << endl;
                 }
             }
-            if (isPbrtDielectric && pbrt.contains("eta"))
+            if (isPbrtDielectric && pbrt.Has("eta"))
             {
-                const float eta = pbrt.value("eta", material.indexOfRefraction);
+                const float eta = gltfNumber(pbrt, "eta", material.indexOfRefraction);
                 if (eta > 0.0f) material.indexOfRefraction = eta;
                 else cerr << "Warning: ignoring non-positive PBRT eta for material " << materialIDs.size() << endl;
             }
-            // Standard glTF material extensions take precedence when both
-            // formats provide the same property.
-            if (extensions.contains("KHR_materials_ior")) material.indexOfRefraction = extensions.at("KHR_materials_ior").value("ior", material.indexOfRefraction);
-            if (!hasPbrtAreaLightRadiance && extensions.contains("KHR_materials_emissive_strength")) material.emission *= extensions.at("KHR_materials_emissive_strength").value("emissiveStrength", 1.0f);
+            // Standard glTF extensions retain their existing precedence.
+            if (extensions.count("KHR_materials_ior"))
+                material.indexOfRefraction = gltfNumber(extensions.at("KHR_materials_ior"), "ior", material.indexOfRefraction);
+            if (!hasPbrtAreaLightRadiance && extensions.count("KHR_materials_emissive_strength"))
+                material.emission *= gltfNumber(extensions.at("KHR_materials_emissive_strength"), "emissiveStrength", 1.0f);
             if (maxComponent(material.emission) > 0.0f) material.type = MATERIAL_EMISSIVE;
             else if (isPbrtDielectric ||
-                (extensions.contains("KHR_materials_transmission") && extensions.at("KHR_materials_transmission").value("transmissionFactor", 0.0f) > 0.0f))
+                (extensions.count("KHR_materials_transmission") &&
+                    gltfNumber(extensions.at("KHR_materials_transmission"), "transmissionFactor", 0.0f) > 0.0f))
             {
                 material.type = MATERIAL_DIELECTRIC;
-                cout << "Imported dielectric material '" << definition.value("name", "<unnamed>")
+                cout << "Imported dielectric material '" << (definition.name.empty() ? "<unnamed>" : definition.name)
                      << "' with IOR " << material.indexOfRefraction << endl;
             }
-            if (pbr.contains("baseColorTexture"))
-                material.baseColorTexture = resolveTexture(pbr.at("baseColorTexture"), "baseColorTexture");
-            if (definition.contains("normalTexture"))
-            {
-                const json& normalTexture = definition.at("normalTexture");
-                material.normalTexture = resolveTexture(normalTexture, "normalTexture");
-                material.normalScale = normalTexture.value("scale", 1.0f);
-            }
+            material.baseColorTexture = resolveTexture(pbr.baseColorTexture, "baseColorTexture");
+            material.metallicRoughnessTexture = resolveTexture(pbr.metallicRoughnessTexture, "metallicRoughnessTexture");
+            material.normalTexture = resolveTexture(definition.normalTexture, "normalTexture");
+            material.normalScale = static_cast<float>(definition.normalTexture.scale);
             materialIDs.push_back(static_cast<int>(materials.size())); materials.push_back(material);
         }
         const int defaultMaterialID = static_cast<int>(materials.size());
         Material defaultMaterial = makeDefaultMaterial(); defaultMaterial.type = MATERIAL_COOK_TORRANCE; materials.push_back(defaultMaterial);
 
         bool hasBounds = false; glm::vec3 boundsMin(0.0f), boundsMax(0.0f);
-        const json& meshes = document.contains("meshes") ? document.at("meshes") : emptyArray;
-        const json& nodes = document.contains("nodes") ? document.at("nodes") : emptyArray;
-        const json& scenes = document.contains("scenes") ? document.at("scenes") : emptyArray;
+        const auto& meshes = model.meshes;
+        const auto& nodes = model.nodes;
+        const auto& scenes = model.scenes;
 
         // Avoid repeated reallocations while expanding indexed meshes into the
         // flat triangle representation. Account for mesh instancing when the
         // same mesh is referenced by more than one node.
         vector<size_t> meshInstanceCounts(meshes.size(), 0);
-        for (const json& node : nodes)
+        for (const tinygltf::Node& node : nodes)
         {
-            if (!node.contains("mesh")) continue;
-            const int meshIndex = node.at("mesh").get<int>();
+            if (node.mesh == -1) continue;
+            const int meshIndex = node.mesh;
             if (meshIndex < 0 || meshIndex >= static_cast<int>(meshes.size()))
                 throw runtime_error("node mesh index out of range");
             ++meshInstanceCounts[meshIndex];
         }
         size_t estimatedTriangleCount = 0;
-        const json& accessors = document.contains("accessors") ? document.at("accessors") : emptyArray;
+        const auto& accessors = model.accessors;
         for (size_t meshIndex = 0; meshIndex < meshes.size(); ++meshIndex)
         {
             if (meshInstanceCounts[meshIndex] == 0) continue;
-            const json& mesh = meshes.at(meshIndex);
-            const json& meshPrimitives = mesh.contains("primitives") ? mesh.at("primitives") : emptyArray;
+            const tinygltf::Mesh& mesh = meshes.at(meshIndex);
+            const auto& meshPrimitives = mesh.primitives;
             size_t meshTriangleCount = 0;
-            for (const json& primitive : meshPrimitives)
+            for (const tinygltf::Primitive& primitive : meshPrimitives)
             {
-                if (primitive.value("mode", GLTF_MODE_TRIANGLES) != GLTF_MODE_TRIANGLES) continue;
-                int accessorIndex = -1;
-                if (primitive.contains("indices")) accessorIndex = primitive.at("indices").get<int>();
-                else if (primitive.contains("attributes") && primitive.at("attributes").contains("POSITION"))
-                    accessorIndex = primitive.at("attributes").at("POSITION").get<int>();
+                if (primitive.mode != TINYGLTF_MODE_TRIANGLES) continue;
+                int accessorIndex = primitive.indices;
+                const auto position = primitive.attributes.find("POSITION");
+                if (accessorIndex == -1 && position != primitive.attributes.end())
+                    accessorIndex = position->second;
                 if (accessorIndex < 0 || accessorIndex >= static_cast<int>(accessors.size())) continue;
-                meshTriangleCount += accessors.at(accessorIndex).value("count", size_t(0)) / 3;
+                meshTriangleCount += accessors.at(accessorIndex).count / 3;
             }
             if (meshTriangleCount > (numeric_limits<size_t>::max() - estimatedTriangleCount) /
                 meshInstanceCounts[meshIndex]) throw runtime_error("scene has too many triangles");
@@ -1297,32 +1226,33 @@ void Scene::loadFromGLTF(const std::string& gltfName)
 
         auto importMesh = [&](int meshIndex, const glm::mat4& world) {
             if (meshIndex < 0 || meshIndex >= static_cast<int>(meshes.size())) throw runtime_error("node mesh index out of range");
-            const json& mesh = meshes.at(meshIndex);
-            const json& meshPrimitives = mesh.contains("primitives") ? mesh.at("primitives") : emptyArray;
+            const tinygltf::Mesh& mesh = meshes.at(meshIndex);
+            const auto& meshPrimitives = mesh.primitives;
             for (size_t primitiveIndex = 0; primitiveIndex < meshPrimitives.size(); ++primitiveIndex)
             {
                 try
                 {
-                    const json& primitive = meshPrimitives.at(primitiveIndex);
-                    if (primitive.value("mode", GLTF_MODE_TRIANGLES) != GLTF_MODE_TRIANGLES) { cerr << "Warning: skipping non-triangle glTF primitive" << endl; continue; }
-                    const json& attributes = primitive.at("attributes");
-                    if (!attributes.contains("POSITION")) throw runtime_error("primitive has no POSITION");
-                    const vector<glm::vec3> positions = readVec3(document, buffers, attributes.at("POSITION").get<int>());
-                    const bool hasNormals = attributes.contains("NORMAL");
-                    const vector<glm::vec3> normals = hasNormals ? readVec3(document, buffers, attributes.at("NORMAL").get<int>()) : vector<glm::vec3>();
+                    const tinygltf::Primitive& primitive = meshPrimitives.at(primitiveIndex);
+                    if (primitive.mode != TINYGLTF_MODE_TRIANGLES) { cerr << "Warning: skipping non-triangle glTF primitive" << endl; continue; }
+                    const auto& attributes = primitive.attributes;
+                    if (attributes.count("POSITION") == 0) throw runtime_error("primitive has no POSITION");
+                    const vector<glm::vec3> positions = readVec3(model, attributes.at("POSITION"));
+                    const bool hasNormals = (attributes.count("NORMAL") != 0);
+                    const vector<glm::vec3> normals = hasNormals ? readVec3(model, attributes.at("NORMAL")) : vector<glm::vec3>();
                     if (hasNormals && normals.size() != positions.size()) throw runtime_error("NORMAL and POSITION counts differ");
-                    const bool hasTextureCoordinates = attributes.contains("TEXCOORD_0");
+                    const bool hasTextureCoordinates = (attributes.count("TEXCOORD_0") != 0);
                     const vector<glm::vec2> textureCoordinates = hasTextureCoordinates ?
-                        readVec2(document, buffers, attributes.at("TEXCOORD_0").get<int>()) : vector<glm::vec2>();
+                        readVec2(model, attributes.at("TEXCOORD_0")) : vector<glm::vec2>();
                     if (hasTextureCoordinates && textureCoordinates.size() != positions.size())
                         throw runtime_error("TEXCOORD_0 and POSITION counts differ");
-                    vector<uint32_t> indices = primitive.contains("indices") ? readIndices(document, buffers, primitive.at("indices").get<int>()) : vector<uint32_t>();
-                    if (!primitive.contains("indices")) { indices.resize(positions.size()); for (size_t i = 0; i < indices.size(); ++i) indices[i] = static_cast<uint32_t>(i); }
+                    vector<uint32_t> indices = primitive.indices != -1 ? readIndices(model, primitive.indices) : vector<uint32_t>();
+                    if (primitive.indices == -1) { indices.resize(positions.size()); for (size_t i = 0; i < indices.size(); ++i) indices[i] = static_cast<uint32_t>(i); }
                     if (indices.size() % 3) throw runtime_error("triangle index count is not divisible by three");
                     int materialID = defaultMaterialID;
-                    if (primitive.contains("material")) { const int sourceID = primitive.at("material").get<int>(); if (sourceID < 0 || sourceID >= static_cast<int>(materialIDs.size())) throw runtime_error("material index out of range"); materialID = materialIDs[sourceID]; }
+                    if (primitive.material != -1) { const int sourceID = primitive.material; if (sourceID < 0 || sourceID >= static_cast<int>(materialIDs.size())) throw runtime_error("material index out of range"); materialID = materialIDs[sourceID]; }
                     const Material& primitiveMaterial = materials[materialID];
-                    if (!hasTextureCoordinates && (primitiveMaterial.baseColorTexture >= 0 || primitiveMaterial.normalTexture >= 0))
+                    if (!hasTextureCoordinates && (primitiveMaterial.baseColorTexture >= 0 ||
+                        primitiveMaterial.normalTexture >= 0 || primitiveMaterial.metallicRoughnessTexture >= 0))
                         cerr << "Warning: textured glTF primitive has no TEXCOORD_0; its texture maps will be skipped" << endl;
                     const glm::mat3 normalMatrix = hasNormals ? glm::transpose(glm::inverse(glm::mat3(world))) : glm::mat3(1.0f);
                     for (size_t i = 0; i < indices.size(); i += 3)
@@ -1354,19 +1284,19 @@ void Scene::loadFromGLTF(const std::string& gltfName)
             if (nodeIndex < 0 || nodeIndex >= static_cast<int>(nodes.size())) throw runtime_error("node index out of range");
             if (activeNodes[nodeIndex]) throw runtime_error("cycle in glTF node hierarchy");
             activeNodes[nodeIndex] = 1;
-            const json& node = nodes.at(nodeIndex); const glm::mat4 world = parent * getNodeTransform(node);
-            if (node.contains("mesh")) importMesh(node.at("mesh").get<int>(), world);
-            if (cameraIndex < 0 && node.contains("camera")) { cameraIndex = node.at("camera").get<int>(); cameraTransform = world; }
-            for (const json& child : node.value("children", json::array())) visitNode(child.get<int>(), world);
+            const tinygltf::Node& node = nodes.at(nodeIndex); const glm::mat4 world = parent * getNodeTransform(node);
+            if (node.mesh != -1) importMesh(node.mesh, world);
+            if (cameraIndex < 0 && node.camera != -1) { cameraIndex = node.camera; cameraTransform = world; }
+            for (int child : node.children) visitNode(child, world);
             activeNodes[nodeIndex] = 0;
         };
         vector<int> roots;
-        const int sceneIndex = document.value("scene", scenes.empty() ? -1 : 0);
-        if (sceneIndex >= 0 && sceneIndex < static_cast<int>(scenes.size())) for (const json& node : scenes.at(sceneIndex).value("nodes", json::array())) roots.push_back(node.get<int>());
+        const int sceneIndex = model.defaultScene >= 0 ? model.defaultScene : (scenes.empty() ? -1 : 0);
+        if (sceneIndex >= 0 && sceneIndex < static_cast<int>(scenes.size())) roots = scenes.at(sceneIndex).nodes;
         else
         {
             vector<bool> child(nodes.size(), false);
-            for (const json& node : nodes) for (const json& value : node.value("children", json::array())) { const int i = value.get<int>(); if (i >= 0 && i < static_cast<int>(child.size())) child[i] = true; }
+            for (const tinygltf::Node& node : nodes) for (int i : node.children) { if (i >= 0 && i < static_cast<int>(child.size())) child[i] = true; }
             for (size_t i = 0; i < child.size(); ++i) if (!child[i]) roots.push_back(static_cast<int>(i));
         }
         for (int root : roots) visitNode(root, glm::mat4(1.0f));
@@ -1375,10 +1305,10 @@ void Scene::loadFromGLTF(const std::string& gltfName)
 
         Camera& camera = state.camera; camera.resolution = glm::ivec2(1200, 800); state.iterations = 6000; state.traceDepth = 8; state.imageName = inputPath.stem().string();
         float yscaled = tan(45.0f * PI / 180.0f);
-        const json cameras = document.value("cameras", json::array());
-        if (cameraIndex >= 0 && cameraIndex < static_cast<int>(cameras.size()) && cameras.at(cameraIndex).value("type", "") == "perspective")
+        const auto& cameras = model.cameras;
+        if (cameraIndex >= 0 && cameraIndex < static_cast<int>(cameras.size()) && cameras.at(cameraIndex).type == "perspective")
         {
-            const json& p = cameras.at(cameraIndex).at("perspective"); yscaled = tan(0.5f * p.at("yfov").get<float>());
+            const auto& p = cameras.at(cameraIndex).perspective; yscaled = tan(0.5f * static_cast<float>(p.yfov));
             camera.position = glm::vec3(cameraTransform * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
             camera.lookAt = camera.position + glm::normalize(glm::vec3(cameraTransform * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f)));
             camera.up = glm::normalize(glm::vec3(cameraTransform * glm::vec4(0.0f, 1.0f, 0.0f, 0.0f)));

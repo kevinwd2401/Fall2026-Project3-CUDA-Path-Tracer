@@ -227,6 +227,9 @@ struct ShadingState
 {
     glm::vec3 normal;
     glm::vec3 color;
+    // Keep full precision, but permit one aligned 64-bit load/store for the
+    // pair. Later kernels consume these values without fetching the map again.
+    float2 metallicRoughness;
     int materialId;
     thrust::default_random_engine rng;
 };
@@ -1398,16 +1401,6 @@ __device__ float srgbToLinear(float value)
     return value <= 0.04045f ? value / 12.92f : powf((value + 0.055f) / 1.055f, 2.4f);
 }
 
-__device__ glm::vec4 sampleBaseColorTexture(const Material& material, const glm::vec2& uv,
-    const DeviceTextureStore& textureStore)
-{
-    if (!textureStore.validTextureIndex(material.baseColorTexture)) return glm::vec4(1.0f);
-    const TextureInfo& texture = textureStore.textures[material.baseColorTexture];
-    const glm::vec4 sampled = sampleTexture(texture, uv, textureStore);
-    return glm::vec4(srgbToLinear(sampled.r), srgbToLinear(sampled.g),
-        srgbToLinear(sampled.b), sampled.a);
-}
-
 __device__ glm::vec3 sampleNormalTexture(const Material& material, const TriangleSoA& triangles,
     int triangleIndex,
     const glm::vec2& uv, glm::vec3 geometricNormal, const DeviceTextureStore& textureStore)
@@ -1664,26 +1657,34 @@ __global__ void prepareShading(
             const PrimitiveRef& hitPrimitive = primitiveStore.primitives[intersection.primitiveIndex];
             const int materialId = primitiveMaterialId(hitPrimitive, primitiveStore);
             Material material = materials[materialId];
+            const bool hasBaseColorMap = textureStore.validTextureIndex(material.baseColorTexture);
+            const bool usesMetallicRoughness = material.type == MATERIAL_COOK_TORRANCE ||
+                material.type == MATERIAL_MICROFACETS;
+            const bool hasMetallicRoughnessMap = usesMetallicRoughness &&
+                textureStore.validTextureIndex(material.metallicRoughnessTexture);
+            const bool needsUV = hasBaseColorMap || hasMetallicRoughnessMap ||
+                textureStore.validTextureIndex(material.normalTexture);
+            const bool hasSurfaceUV = needsUV && hitPrimitive.type == TRIANGLE &&
+                primitiveStore.triangles.attributes[hitPrimitive.index].hasTextureCoordinates;
             glm::vec2 surfaceUV(0.0f);
-            if (hitPrimitive.type == TRIANGLE)
+            if (hasSurfaceUV)
             {
                 const TriangleAttributes& attributes = primitiveStore.triangles.attributes[hitPrimitive.index];
-                if (attributes.hasTextureCoordinates)
-                {
-                    surfaceUV = triangleSurfaceUV(attributes, intersection.barycentrics);
-                }
+                surfaceUV = triangleSurfaceUV(attributes, intersection.barycentrics);
             }
 
-            // Sample texture for color and alpha
-            glm::vec4 baseColorSample(1.0f);
-            if (hitPrimitive.type == TRIANGLE &&
-                primitiveStore.triangles.attributes[hitPrimitive.index].hasTextureCoordinates)
+            // Retain the raw sample so a shared base-color/metallic-roughness
+            // texture needs only one lookup. Only base color is sRGB decoded.
+            glm::vec4 rawBaseColorSample(1.0f);
+            if (hasSurfaceUV && hasBaseColorMap)
             {
-                baseColorSample = sampleBaseColorTexture(material, surfaceUV, textureStore);
-                material.color *= glm::vec3(baseColorSample);
+                rawBaseColorSample = sampleTexture(textureStore.textures[material.baseColorTexture],
+                    surfaceUV, textureStore);
+                material.color *= glm::vec3(srgbToLinear(rawBaseColorSample.r),
+                    srgbToLinear(rawBaseColorSample.g), srgbToLinear(rawBaseColorSample.b));
             }
 
-            const float opacity = glm::clamp(material.alpha * baseColorSample.a, 0.0f, 1.0f);
+            const float opacity = glm::clamp(material.alpha * rawBaseColorSample.a, 0.0f, 1.0f);
             bool ignoreIntersection = false;
             if (material.alphaMode == ALPHA_MASK)
             {
@@ -1735,6 +1736,16 @@ __global__ void prepareShading(
             }
             else {
 				// will be shaded in shadeBSDF kernel
+                if (hasSurfaceUV && hasMetallicRoughnessMap)
+                {
+                    // glTF packs roughness in G and metalness in B. Both are
+                    // linear data: multiply the factors without sRGB decoding.
+                    const glm::vec4 packed = material.metallicRoughnessTexture == material.baseColorTexture ?
+                        rawBaseColorSample : sampleTexture(
+                            textureStore.textures[material.metallicRoughnessTexture], surfaceUV, textureStore);
+                    material.metallic *= packed.b;
+                    material.roughness *= packed.g;
+                }
                 const glm::vec3 hitPoint = pathSegment.ray.origin + intersection.t * pathSegment.ray.direction;
                 glm::vec3 geometricNormal = lightSurfaceNormal(hitPrimitive, primitiveStore, hitPoint);
                 if (hitPrimitive.type == TRIANGLE)
@@ -1749,8 +1760,7 @@ __global__ void prepareShading(
                         if (glm::dot(normal, normal) >= 1e-16f) geometricNormal = glm::normalize(normal);
                     }
                 }
-                if (hitPrimitive.type == TRIANGLE &&
-                    primitiveStore.triangles.attributes[hitPrimitive.index].hasTextureCoordinates)
+                if (hasSurfaceUV)
                 {
                     geometricNormal = sampleNormalTexture(material, primitiveStore.triangles, hitPrimitive.index, surfaceUV,
                         geometricNormal, textureStore);
@@ -1758,6 +1768,7 @@ __global__ void prepareShading(
                 ShadingState& state = shadingStates[idx];
                 state.normal = geometricNormal;
                 state.color = material.color;
+                state.metallicRoughness = make_float2(material.metallic, material.roughness);
                 state.rng = makeSeededRandomEngine(iter, pathSegment.pixelIndex,
                     pathSegment.remainingBounces);
                 state.materialId = materialId;
@@ -1821,6 +1832,9 @@ __global__ void generateDirectLighting(
     Material material = materials[state.materialId];
     if (material.type == MATERIAL_MIRROR || material.type == MATERIAL_DIELECTRIC) return;
     material.color = state.color;
+    const float2 metallicRoughness = state.metallicRoughness;
+    material.metallic = metallicRoughness.x;
+    material.roughness = metallicRoughness.y;
     const PathSegment& path = paths[idx];
     const glm::vec3 point = path.ray.origin + intersections[idx].t * path.ray.direction;
     const glm::vec3 normal = glm::dot(path.ray.direction, state.normal) < 0.0f ?
@@ -1880,6 +1894,9 @@ __global__ void shadeBSDF(
     const ShadingState& state = shadingStates[idx];
     Material material = materials[state.materialId];
     material.color = state.color;
+    const float2 metallicRoughness = state.metallicRoughness;
+    material.metallic = metallicRoughness.x;
+    material.roughness = metallicRoughness.y;
     PathSegment& pathSegment = paths[idx];
     const glm::vec3 incoming = glm::normalize(pathSegment.ray.direction);
     const glm::vec3 intersect = pathSegment.ray.origin + intersections[idx].t * pathSegment.ray.direction;

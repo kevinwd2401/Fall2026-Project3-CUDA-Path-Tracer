@@ -146,6 +146,7 @@ struct Material
     float roughness;
     int baseColorTexture;
     int normalTexture;
+    int metallicRoughnessTexture;
     float normalScale;
     AlphaMode alphaMode;
     float alphaCutoff;
