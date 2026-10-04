@@ -3,7 +3,6 @@
 #include "sceneStructs.h"
 
 #include <glm/glm.hpp>
-#include <glm/gtx/intersect.hpp>
 #include <cfloat>
 
 
@@ -21,61 +20,12 @@ __host__ __device__ inline unsigned int utilhash(unsigned int a)
     return a;
 }
 
-// CHECKITOUT
-/**
- * Compute a point at parameter value `t` on ray `r`.
- * Falls slightly short so that it doesn't intersect the object it's hitting.
- */
-__host__ __device__ inline glm::vec3 getPointOnRay(const Ray& r, float t)
-{
-    return r.origin + (t - .0001f) * glm::normalize(r.direction);
-}
-
 /**
  * Multiplies a mat4 and a vec4 and returns a vec3 clipped from the vec4.
  */
 __host__ __device__ inline glm::vec3 multiplyMV(const glm::mat4& m, const glm::vec4& v)
 {
     return glm::vec3(m * v);
-}
-
-/**
- * Intersect a world-space axis-aligned bounding box.  maxDistance is the
- * nearest primitive hit already found, so nodes farther than it can be
- * skipped during BVH traversal.
- */
-__host__ __device__ inline bool aabbIntersectionTest(
-    const Ray& ray,
-    const glm::vec3& boundsMin,
-    const glm::vec3& boundsMax,
-    float maxDistance,
-    float& entryDistance)
-{
-    float tNear = -1.0e30f;
-    float tFar = maxDistance;
-    for (int axis = 0; axis < 3; ++axis)
-    {
-        const float origin = ray.origin[axis];
-        const float direction = ray.direction[axis];
-        if (direction == 0.0f)
-        {
-            if (origin < boundsMin[axis] || origin > boundsMax[axis]) return false;
-            continue;
-        }
-        float t0 = (boundsMin[axis] - origin) / direction;
-        float t1 = (boundsMax[axis] - origin) / direction;
-        if (t0 > t1)
-        {
-            const float temporary = t0;
-            t0 = t1;
-            t1 = temporary;
-        }
-        tNear = glm::max(tNear, t0);
-        tFar = glm::min(tFar, t1);
-        if (tNear > tFar) return false;
-    }
-    entryDistance = glm::max(tNear, 0.0f);
-    return tFar >= 0.0f;
 }
 
 // Cache reciprocals once per ray, rather than divide at every visited node.
@@ -200,46 +150,3 @@ __host__ __device__ inline float triangleDistanceTest(const glm::vec3& vertex,
     barycentrics = glm::vec2(u, v);
     return t;
 }
-
-// CHECKITOUT
-/**
- * Test intersection between a ray and a transformed cube. Untransformed,
- * the cube ranges from -0.5 to 0.5 in each axis and is centered at the origin.
- *
- * @param intersectionPoint  Output parameter for point of intersection.
- * @param normal             Output parameter for surface normal.
- * @param outside            Output param for whether the ray came from outside.
- * @return                   Ray parameter `t` value. -1 if no intersection.
- */
-__host__ __device__ float boxIntersectionTest(
-    const Cube& box,
-    const Ray& r,
-    glm::vec3& intersectionPoint,
-    glm::vec3& normal,
-    bool& outside);
-
-// CHECKITOUT
-/**
- * Test intersection between a ray and a transformed sphere. Untransformed,
- * the sphere always has radius 0.5 and is centered at the origin.
- *
- * @param intersectionPoint  Output parameter for point of intersection.
- * @param normal             Output parameter for surface normal.
- * @param outside            Output param for whether the ray came from outside.
- * @return                   Ray parameter `t` value. -1 if no intersection.
- */
-__host__ __device__ float sphereIntersectionTest(
-    const Sphere& sphere,
-    const Ray& r,
-    glm::vec3& intersectionPoint,
-    glm::vec3& normal,
-    bool& outside);
-
-/** Test a ray against a world-space triangle. */
-__host__ __device__ float triangleIntersectionTest(
-    const Triangle& triangle,
-    const Ray& r,
-    glm::vec3& intersectionPoint,
-    glm::vec3& normal,
-    glm::vec2& uv,
-    bool& outside);

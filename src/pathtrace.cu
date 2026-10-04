@@ -1864,7 +1864,7 @@ __device__ void finishScattering(PathSegment& path, int traceDepth, thrust::defa
 #endif
 }
 
-// Scattering no longer carries texture, light-sampling, or emission temporaries.
+// No texture, light-sampling, or emission temporaries.
 __global__ void shadeBSDF(
     int traceDepth,
     int numPaths,
@@ -1875,6 +1875,7 @@ __global__ void shadeBSDF(
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numPaths || paths[idx].remainingBounces <= 0) return;
+    //volumetric phase function
     if (intersections[idx].type == INTERACTION_MEDIUM)
     {
         PathSegment& path = paths[idx];
@@ -1886,7 +1887,7 @@ __global__ void shadeBSDF(
         path.previousEventWasDelta = false;
         path.previousScatteringPoint = point;
         path.previousMediumLogPdfRatio = 0.0f;
-        path.ray = {point, sample.direction}; // no surface offset inside a medium
+        path.ray = {point, sample.direction};
         finishScattering(path, traceDepth, rng);
         return;
     }
@@ -1928,9 +1929,8 @@ __global__ void shadeBSDF(
     case MATERIAL_COOK_TORRANCE:
     {
         // glTF's metallic-roughness model contains both a diffuse
-        // dielectric lobe and a GGX specular lobe.  Choose one
-        // lobe per bounce and compensate for that choice in the
-        // throughput so the result remains an unbiased mixture.
+        // dielectric lobe and a GGX specular lobe.
+        // One lobe chosen per bounce
         const float roughness = glm::clamp(material.roughness, 0.001f, 1.0f);
         const float metallic = glm::clamp(material.metallic, 0.0f, 1.0f);
         const glm::vec3 f0 = glm::mix(glm::vec3(0.04f), material.color, metallic);
@@ -1968,8 +1968,7 @@ __global__ void shadeBSDF(
         }
         else
         {
-            // Sample_f_microfacet_refl returns black when the
-            // reflected direction leaves wo's hemisphere.
+            // Returns black when the reflected direction leaves wo's hemisphere.
             pathSegment.color = glm::vec3(0.0f);
             pathSegment.previousScatteringPdf = 0.0f;
             pathSegment.remainingBounces = 0;
@@ -2148,18 +2147,6 @@ const int* orderRays(int count, const RayPayload* rays, int blockSize, const int
 }
 #endif
 
-// Add the current iteration's output to the overall image
-__global__ void finalGather(int nPaths, glm::vec3* image, PathSegment* iterationPaths)
-{
-    int index = (blockIdx.x * blockDim.x) + threadIdx.x;
-
-    if (index < nPaths)
-    {
-        PathSegment iterationPath = iterationPaths[index];
-        image[iterationPath.pixelIndex] += iterationPath.radiance;
-    }
-}
-
 // Add paths that are about to be compacted away to the accumulated image.
 __global__ void gatherTerminatedPaths(int nPaths, glm::vec3* image, PathSegment* iterationPaths)
 {
@@ -2298,8 +2285,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             numShadowRays = compactShadowIndices(num_paths);
             checkCUDAError("compact shadow indices");
 #else
-            // Keep the full queue to avoid the host readback.  The shadow
-            // kernel checks active, so inactive slots are harmless.
+            // The shadow kernel checks active
             numShadowRays = num_paths;
 #endif
         }

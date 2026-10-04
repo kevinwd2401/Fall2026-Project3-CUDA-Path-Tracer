@@ -2,6 +2,12 @@
 
 // Compile-time benchmark controls
 
+#ifndef ENABLE_TONEMAPPING
+// 1 applies the ACES-fitted curve and display gamma; 0 outputs clamped
+// scene-linear radiance for an un-tonemapped comparison.
+#define ENABLE_TONEMAPPING 1
+#endif
+
 #ifndef USE_BVH
 // 1 uses the flattened SAH BVH; 0 skips BVH construction/upload and tests
 // every primitive in the linear traversal kernels for a baseline.

@@ -12,6 +12,11 @@
             "TYPE":"Diffuse",
             "RGB":[0.98, 0.98, 0.98]
         },
+        "mf":
+        {
+            "TYPE":"mirror",
+            "RGB":[0.95, 0.98, 0.95]
+        },
         "diffuse_red":
         {
             "TYPE":"Diffuse",
@@ -24,7 +29,7 @@
         },
         "specular_white":
         {
-            "TYPE":"Diffuse",
+            "TYPE":"Glass",
             "RGB":[0.98, 0.98, 0.98],
             "ROUGHNESS":0.0
         }
@@ -65,7 +70,7 @@
         },
         {
             "TYPE":"cube",
-            "MATERIAL":"diffuse_white",
+            "MATERIAL":"mf",
             "TRANS":[0.0,5.0,-5.0],
             "ROTAT":[0.0,90.0,0.0],
             "SCALE":[0.01,10.0,10.0]
@@ -86,7 +91,7 @@
         },
         {
             "TYPE":"sphere",
-            "MATERIAL":"specular_white",
+            "MATERIAL":"mf",
             "TRANS":[-1.0,4.0,-1.0],
             "ROTAT":[0.0,0.0,0.0],
             "SCALE":[3.0,3.0,3.0]
