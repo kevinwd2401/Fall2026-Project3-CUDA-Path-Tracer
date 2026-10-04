@@ -104,13 +104,14 @@ Bounds boundsForTriangle(const Triangle& triangle)
 }
 
 Bounds boundsForPrimitive(const PrimitiveRef& primitive, const std::vector<Cube>& cubes,
-    const std::vector<Sphere>& spheres, const std::vector<Triangle>& triangles)
+    const std::vector<Sphere>& spheres, const std::vector<Triangle>& triangles, const Volume& volume)
 {
     switch (primitive.type)
     {
     case CUBE: return boundsForCube(cubes[primitive.index]);
     case SPHERE: return boundsForSphere(spheres[primitive.index]);
     case TRIANGLE: return boundsForTriangle(triangles[primitive.index]);
+    case VOLUME: return Bounds{volume.boundsMin, volume.boundsMax};
     }
     return Bounds{};
 }
@@ -123,6 +124,7 @@ int materialForPrimitive(const PrimitiveRef& primitive, const std::vector<Cube>&
     case CUBE: return cubes[primitive.index].materialid;
     case SPHERE: return spheres[primitive.index].materialid;
     case TRIANGLE: return triangles[primitive.index].materialid;
+    case VOLUME: return -1; // medium parameters are independent of surface materials
     }
     return -1;
 }
@@ -442,14 +444,51 @@ glm::mat4 getNodeTransform(const json& node)
 }
 }
 
-Scene::Scene(string filename, string environmentFilename)
+Scene::Scene(string filename, string environmentFilename, string volumeFilename, float volumeScale)
 {
-    cout << "Reading scene from " << filename << " ..." << endl << " " << endl;
-    const string extension = lowercase(filesystem::path(filename).extension().string());
-    if (extension == ".json") loadFromJSON(filename);
-    else if (extension == ".gltf" || extension == ".glb") loadFromGLTF(filename);
-    else { cout << "Couldn't read from " << filename << endl; exit(-1); }
+    if (filename.empty())
+    {
+        if (environmentFilename.empty() || volumeFilename.empty())
+            throw runtime_error("A volume-only scene requires both an HDRI and a NanoVDB file");
+        cout << "Creating volume-only scene ..." << endl;
+    }
+    else
+    {
+        cout << "Reading scene from " << filename << " ..." << endl << " " << endl;
+        const string extension = lowercase(filesystem::path(filename).extension().string());
+        if (extension == ".json") loadFromJSON(filename);
+        else if (extension == ".gltf" || extension == ".glb") loadFromGLTF(filename);
+        else throw runtime_error("Unsupported scene file: " + filename);
+    }
     if (!environmentFilename.empty()) loadEnvironmentMap(environmentFilename);
+    if (!volumeFilename.empty())
+    {
+        volume = loadNanoVDB(volumeFilename, volumeScale);
+        primitives.push_back({VOLUME, 0});
+        cout << "Loaded NanoVDB density " << volumeFilename << " (scale " << volumeScale << ")" << endl;
+    }
+    if (filename.empty())
+    {
+        Camera& camera = state.camera;
+        camera.resolution = glm::ivec2(1200, 800);
+        state.iterations = 6000;
+        state.traceDepth = 8;
+        state.imageName = filesystem::path(volumeFilename).stem().string();
+        camera.lookAt = volume.medium.scaleCenter;
+        camera.up = glm::vec3(0.0f, 1.0f, 0.0f);
+        // Fit the scaled bounds along -Z with a full vertical FOV of 60 degrees.
+        // At the front face, both horizontal and vertical extents fit with margin.
+        const float yscaled = tan(30.0f * PI / 180.0f);
+        const float xscaled = yscaled * float(camera.resolution.x) / float(camera.resolution.y);
+        const glm::vec3 halfExtent = volume.medium.boundsMax * 0.5f - volume.medium.boundsMin * 0.5f;
+        const float distance = std::max(0.001f, halfExtent.z +
+            1.1f * std::max(halfExtent.x / xscaled, halfExtent.y / yscaled));
+        camera.position = camera.lookAt + glm::vec3(0.0f, 0.0f, distance);
+        if (!std::isfinite(distance) || !std::isfinite(camera.position.z) ||
+            !(camera.position.z > volume.medium.boundsMax.z))
+            throw runtime_error("Volume bounds are too extreme to frame a default camera");
+        finalizeCamera(camera, state, yscaled);
+    }
 #if USE_BVH
     buildBVH();
 #endif
@@ -593,7 +632,7 @@ void Scene::buildBVH()
     std::vector<glm::vec3> primitiveCentroids(primitives.size());
     for (size_t i = 0; i < primitives.size(); ++i)
     {
-        primitiveBounds[i] = boundsForPrimitive(primitives[i], cubes, spheres, triangles);
+        primitiveBounds[i] = boundsForPrimitive(primitives[i], cubes, spheres, triangles, volume.medium);
         primitiveCentroids[i] = 0.5f * (primitiveBounds[i].minimum + primitiveBounds[i].maximum);
     }
 
@@ -631,10 +670,8 @@ void Scene::buildBVH()
         int bestAxis = -1;
         int bestSplit = -1;
 
-        // TODO (BVH study block): Change BVH_SAH_BINS and observe how the
-        // chosen tree and render time change.  This is binned SAH: each
-        // candidate cost is parentArea + area(left) * count(left) +
-        // area(right) * count(right).
+        // Binned SAH candidate cost: parentArea + area(left) * count(left)
+        // + area(right) * count(right).
         for (int axis = 0; axis < 3; ++axis)
         {
             const float extent = centroidBounds.maximum[axis] - centroidBounds.minimum[axis];

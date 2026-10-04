@@ -13,7 +13,8 @@ enum GeomType
 {
     SPHERE,
     CUBE,
-    TRIANGLE
+    TRIANGLE,
+    VOLUME
 };
 
 enum MaterialType
@@ -39,6 +40,21 @@ struct Ray
     glm::vec3 origin;
     glm::vec3 direction;
 };
+
+// Single bounded, non-emissive medium, coefficients use inverse world units.
+struct Volume
+{
+    glm::vec3 boundsMin{0.0f};
+    glm::vec3 boundsMax{0.0f};
+    glm::vec3 scaleCenter{0.0f}; // world-space pivot; preserves the authored center
+    float inverseScale = 1.0f; // scene world -> original grid world
+    glm::vec3 albedo{0.9f}; // sigma_s / sigma_t, per color channel
+    float extinction = 1.0f; // sigma_t = density * extinction
+    float majorant = 0.0f;  // conservative global bound on sigma_t
+    float g = 0.2f;
+};
+
+enum InteractionType { INTERACTION_MISS, INTERACTION_SURFACE, INTERACTION_MEDIUM };
 
 struct PrimitiveRef
 {
@@ -179,8 +195,14 @@ struct PathSegment
     glm::vec3 radiance;
     int pixelIndex;
     int remainingBounces;
-    float previousBsdfPdf;
-    bool previousBounceWasSpecular;
+    float previousScatteringPdf;
+    bool previousEventWasDelta;
+    // Alpha pass-throughs move ray.origin but must retain the last real vertex
+    // for the complementary light PDF at an eventual emitter hit.
+    glm::vec3 previousScatteringPoint;
+    // log(product sigma_null / sigma_majorant) since the last real vertex.
+    // Ratio of delta-tracking to ratio-tracking densities for the null history.
+    float previousMediumLogPdfRatio;
 };
 
 // Use with a corresponding PathSegment to do:
@@ -188,9 +210,14 @@ struct PathSegment
 // 2) BSDF evaluation: generate a new ray
 struct ShadeableIntersection
 {
+  InteractionType type;
   float t;
   // Triangle barycentrics
   // Normals and UVs are reconstructed once in shading, outside traversal.
   glm::vec2 barycentrics;
   int primitiveIndex;
+  // Candidate volume interval, independent of the closest surface hit.
+  float volumeEnter;
+  float volumeExit;
+  bool hasVolumeInterval;
 };

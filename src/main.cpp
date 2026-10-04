@@ -23,6 +23,11 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <filesystem>
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <stdexcept>
 
 static std::string startTimeString;
 
@@ -357,19 +362,61 @@ int main(int argc, char** argv)
 
     if (argc < 2)
     {
-        printf("Usage: %s SCENEFILE.(json|gltf|glb) [HDRI_FILE]\n", argv[0]);
+        printf("Usage: %s SCENEFILE.(json|gltf|glb) [HDRI_FILE] [VOLUME_FILE.nvdb] [--volume-scale FACTOR]\n", argv[0]);
+        printf("   or: %s HDRI_FILE VOLUME_FILE.nvdb [--volume-scale FACTOR]\n", argv[0]);
+        printf("Files and options can be given in any order; only one of each is allowed.\n");
+        printf("Volume scale defaults to 1; positive values scale about the volume center.\n");
         return 1;
     }
 
-    const char* sceneFile = argv[1];
-    const char* environmentFile = argc >= 3 ? argv[2] : nullptr;
-
-    // Load scene file
-    scene = new Scene(sceneFile, environmentFile ? environmentFile : "");
+    std::string sceneFile, environmentFile, volumeFile;
+    float volumeScale = 1.0f;
+    bool volumeScaleSpecified = false;
+    try
+    {
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string argument = argv[i];
+            if (argument == "--volume-scale")
+            {
+                if (volumeScaleSpecified) throw std::runtime_error("--volume-scale may only be supplied once");
+                if (++i >= argc) throw std::runtime_error("--volume-scale requires a positive finite number");
+                const std::string value = argv[i];
+                size_t consumed = 0;
+                try { volumeScale = std::stof(value, &consumed); }
+                catch (const std::exception&) { throw std::runtime_error("--volume-scale requires a positive finite number"); }
+                if (consumed != value.size() || !std::isfinite(volumeScale) || volumeScale <= 0.0f ||
+                    !std::isfinite(1.0f / volumeScale))
+                    throw std::runtime_error("--volume-scale requires a positive finite number with a finite reciprocal");
+                volumeScaleSpecified = true;
+                continue;
+            }
+            if (argument.rfind("--", 0) == 0)
+                throw std::runtime_error("Unknown option: " + argument);
+            std::string extension = std::filesystem::path(argv[i]).extension().string();
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            const bool sceneArgument = extension == ".json" || extension == ".gltf" || extension == ".glb";
+            std::string& target = sceneArgument ? sceneFile : (extension == ".nvdb" ? volumeFile : environmentFile);
+            if (!target.empty()) throw std::runtime_error("Only one scene, one HDRI and one NanoVDB file may be supplied");
+            target = argv[i];
+        }
+        if (volumeScaleSpecified && volumeFile.empty())
+            throw std::runtime_error("--volume-scale requires a NanoVDB file");
+        if (sceneFile.empty() && (environmentFile.empty() || volumeFile.empty()))
+            throw std::runtime_error("Supply a JSON/glTF/GLB scene, or both an HDRI and a NanoVDB file");
+        scene = new Scene(sceneFile, environmentFile, volumeFile, volumeScale);
+    }
+    catch (const std::exception& error)
+    {
+        std::cerr << "Error: " << error.what() << std::endl;
+        delete scene;
+        return EXIT_FAILURE;
+    }
     if (scene->emissivePrimitives.empty() && !scene->environment.valid())
     {
         std::cerr << "Error: scene has no light sources. Add an emissive primitive or pass an HDRI "
-                  << "environment map as the second argument." << std::endl;
+                  << "environment map." << std::endl;
         delete scene;
         return EXIT_FAILURE;
     }

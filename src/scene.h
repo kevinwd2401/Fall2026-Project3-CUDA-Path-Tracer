@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sceneStructs.h"
+#include "volume.h"
 #include <vector>
 
 class Scene
@@ -12,7 +13,9 @@ private:
     void rebuildEmissivePrimitives();
     void buildBVH();
 public:
-    Scene(std::string filename, std::string environmentFilename = "");
+    // An empty filename creates a volume-only scene; HDRI and NanoVDB are required.
+    Scene(std::string filename, std::string environmentFilename = "", std::string volumeFilename = "",
+        float volumeScale = 1.0f);
 
     // Scene-wide primitive ordering.  Other per-primitive structures store
     // indices into this array; the ref selects an entry in a typed list.
@@ -20,6 +23,7 @@ public:
     std::vector<Cube> cubes;
     std::vector<Sphere> spheres;
     std::vector<Triangle> triangles;
+    VolumeAsset volume; // exactly one optional grid; owns aligned host storage
     std::vector<BVHNode> bvhNodes;
     std::vector<int> bvhPrimitiveIndices;
     std::vector<Material> materials;

@@ -48,6 +48,20 @@ set(GLM_ROOT_DIR "${CMAKE_SOURCE_DIR}/external")
 find_package(GLM REQUIRED)
 include_directories(${GLM_INCLUDE_DIRS})
 
+# NanoVDB's IO and grid access are header-only. Use an installed header tree,
+# or fetch the pinned release without configuring/building OpenVDB itself.
+find_path(NANOVDB_INCLUDE_DIR nanovdb/NanoVDB.h
+    HINTS "${CMAKE_SOURCE_DIR}/external/include" "${NANOVDB_ROOT}/nanovdb" "${NANOVDB_ROOT}/include")
+if(NOT NANOVDB_INCLUDE_DIR)
+    include(FetchContent)
+    FetchContent_Declare(nanovdb_headers
+        URL https://github.com/AcademySoftwareFoundation/openvdb/archive/refs/tags/v12.1.0.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        SOURCE_SUBDIR header-only-no-cmake)
+    FetchContent_MakeAvailable(nanovdb_headers)
+    set(NANOVDB_INCLUDE_DIR "${nanovdb_headers_SOURCE_DIR}/nanovdb")
+endif()
+
 set(headers
     src/image.h
     src/tonemapping.h
@@ -58,6 +72,8 @@ set(headers
     src/scene.h
     src/sceneStructs.h
     src/utilities.h
+    src/volume.h
+    src/volume.cuh
 )
 
 set(sources
@@ -70,6 +86,7 @@ set(sources
     src/interactions.cu
     src/scene.cpp
     src/utilities.cpp
+    src/volume.cpp
 )
 
 set(imgui_headers
@@ -108,6 +125,18 @@ source_group("ImGui\\Sources" FILES ${imgui_sources})
 #add_subdirectory(stream_compaction)  # TODO: uncomment if using your stream compaction
 
 add_executable(${CMAKE_PROJECT_NAME} ${sources} ${headers} ${imgui_sources} ${imgui_headers})
+target_include_directories(${CMAKE_PROJECT_NAME} SYSTEM PRIVATE "${NANOVDB_INCLUDE_DIR}")
+# NanoVDB's CUDA headers use explicitly annotated device lambdas.
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--extended-lambda>
+)
+# Uncompressed .nvdb files work with no optional compression libraries.
+option(NANOVDB_ENABLE_ZIP "Read ZIP-compressed NanoVDB files (requires ZLIB)" OFF)
+if(NANOVDB_ENABLE_ZIP)
+    find_package(ZLIB REQUIRED)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE NANOVDB_USE_ZIP)
+    target_link_libraries(${CMAKE_PROJECT_NAME} ZLIB::ZLIB)
+endif()
 
 if (MSVC)
     target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
