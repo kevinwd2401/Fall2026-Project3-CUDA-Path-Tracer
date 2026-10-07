@@ -557,5 +557,5 @@ xcuserdata
 *.xccheckout
 *.moved-aside
 *.xcuserstate
-/scenes
 /tests
+/benchmarks
